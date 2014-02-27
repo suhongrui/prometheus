@@ -14,7 +14,6 @@
 package metric
 
 import (
-	"container/heap"
 	"fmt"
 	"os"
 	"sort"
@@ -405,7 +404,6 @@ func (t *TieredStorage) renderView(viewJob viewJob) {
 	}()
 
 	scanJobsTimer := viewJob.stats.GetTimer(stats.ViewScanJobsTime).Start()
-	scans := viewJob.builder.ScanJobs()
 	scanJobsTimer.Stop()
 	view := newView()
 
@@ -422,8 +420,8 @@ func (t *TieredStorage) renderView(viewJob viewJob) {
 	defer t.dtoSampleKeys.Give(sampleKeyDto)
 
 	extractionTimer := viewJob.stats.GetTimer(stats.ViewDataExtractionTime).Start()
-	for scans.Len() > 0 {
-		scanJob := heap.Pop(&scans).(*scanJob)
+	for viewJob.builder.HasScanJobs() {
+		scanJob := viewJob.builder.PopScanJob()
 		op := scanJob.operation
 		old, err := t.seriesTooOld(&scanJob.fingerprint, op.CurrentTime())
 		if err != nil {

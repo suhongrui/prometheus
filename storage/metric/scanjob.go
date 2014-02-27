@@ -36,7 +36,8 @@ func (s scanJobs) Len() int {
 	return len(s)
 }
 
-// Less compares the fingerprints. If they are equal, the operations are compared.
+// Less compares the fingerprints. If they are equal, the StartsAt timestamps of
+// the operations are compared.
 func (s scanJobs) Less(i, j int) bool {
 	si := s[i]
 	sj := s[j]

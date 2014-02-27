@@ -34,7 +34,8 @@ type ViewRequestBuilder interface {
 	GetMetricAtTime(fingerprint *clientmodel.Fingerprint, time clientmodel.Timestamp)
 	GetMetricAtInterval(fingerprint *clientmodel.Fingerprint, from, through clientmodel.Timestamp, interval time.Duration)
 	GetMetricRange(fingerprint *clientmodel.Fingerprint, from, through clientmodel.Timestamp)
-	ScanJobs() scanJobs
+	PopScanJob() *scanJob
+	HasScanJobs() bool
 }
 
 // viewRequestBuilder contains the various requests for data.
@@ -103,12 +104,15 @@ func (v *viewRequestBuilder) GetMetricRangeAtInterval(fp *clientmodel.Fingerprin
 	heap.Push(&v.operations, &scanJob{fingerprint: *fp, operation: op})
 }
 
-// ScanJobs emits the scans that will occur in the data store.  This effectively
-// resets the ViewRequestBuilder back to a pristine state.
-func (v *viewRequestBuilder) ScanJobs() scanJobs {
-	operationsToEmit := v.operations
-	v.operations = scanJobs{}
-	return operationsToEmit
+// PopScanJob emits the next ScanJob in the queue. Only call if HasScanJobs
+// returns true.
+func (v *viewRequestBuilder) PopScanJob() *scanJob {
+	return heap.Pop(&v.operations).(*scanJob)
+}
+
+// HasScanJobs returns true if there is at least one more ScanJob in the queue.
+func (v *viewRequestBuilder) HasScanJobs() bool {
+	return v.operations.Len() > 0
 }
 
 type view struct {

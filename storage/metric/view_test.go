@@ -14,7 +14,6 @@
 package metric
 
 import (
-	"container/heap"
 	"testing"
 	"time"
 
@@ -174,17 +173,14 @@ func testBuilder(t test.Tester) {
 			builder.GetMetricRange(fingerprint, atRange.from, atRange.through)
 		}
 
-		jobs := builder.ScanJobs()
-
-		if len(scenario.out) != jobs.Len() {
-			t.Fatalf("%d. expected job length of %d, got %d", i, len(scenario.out), jobs.Len())
-		}
-
 		for j, job := range scenario.out {
-			got := heap.Pop(&jobs).(*scanJob)
+			got := builder.PopScanJob()
 			if got.fingerprint.String() != job.fingerprint {
-				t.Fatalf("%d.%d. expected fingerprint %s, got %s", i, j, job.fingerprint, got.fingerprint)
+				t.Errorf("%d.%d. expected fingerprint %s, got %s", i, j, job.fingerprint, got.fingerprint)
 			}
+		}
+		if builder.HasScanJobs() {
+			t.Error("Expected builder to have no scan jobs left.")
 		}
 	}
 }
