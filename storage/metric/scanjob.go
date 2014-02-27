@@ -14,42 +14,52 @@
 package metric
 
 import (
-	"bytes"
 	"fmt"
 
 	clientmodel "github.com/prometheus/client_golang/model"
 )
 
-// scanJob models a range of queries.
+// scanJob is an operation with a fingerprint of what to operate on.
 type scanJob struct {
-	fingerprint *clientmodel.Fingerprint
-	operations  ops
+	fingerprint clientmodel.Fingerprint
+	operation   op
 }
 
 func (s scanJob) String() string {
-	buffer := &bytes.Buffer{}
-	fmt.Fprintf(buffer, "Scan Job { fingerprint=%s ", s.fingerprint)
-	fmt.Fprintf(buffer, " with %d operations [", len(s.operations))
-	for _, operation := range s.operations {
-		fmt.Fprintf(buffer, "%s", operation)
-	}
-	fmt.Fprintf(buffer, "] }")
-
-	return buffer.String()
+	return fmt.Sprintf("Scan Job { fingerprint=%s with operation [%s] ", s.fingerprint, s.operation)
 }
 
-type scanJobs []scanJob
+// scanJobs is a heap of scanJobs, primary sorting key is the fingerprint.
+type scanJobs []*scanJob
 
 func (s scanJobs) Len() int {
 	return len(s)
 }
 
-func (s scanJobs) Less(i, j int) (less bool) {
-	less = s[i].fingerprint.Less(s[j].fingerprint)
-
-	return
+// Less compares the fingerprints. If they are equal, the operations are compared.
+func (s scanJobs) Less(i, j int) bool {
+	si := s[i]
+	sj := s[j]
+	if si.fingerprint.Equal(&sj.fingerprint) {
+		return si.operation.StartsAt().Before(sj.operation.StartsAt())
+	}
+	return si.fingerprint.Less(&sj.fingerprint)
 }
 
 func (s scanJobs) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
+}
+
+func (s *scanJobs) Push(x interface{}) {
+	// Push and Pop use pointer receivers because they modify the slice's length,
+	// not just its contents.
+	*s = append(*s, x.(*scanJob))
+}
+
+func (s *scanJobs) Pop() interface{} {
+	old := *s
+	n := len(old)
+	x := old[n-1]
+	*s = old[0 : n-1]
+	return x
 }

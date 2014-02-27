@@ -14,6 +14,7 @@
 package metric
 
 import (
+	"container/heap"
 	"testing"
 	"time"
 
@@ -106,6 +107,12 @@ func testBuilder(t test.Tester) {
 					fingerprint: "00000000000000000000-a-4-a",
 				},
 				{
+					fingerprint: "00000000000000000000-a-4-a",
+				},
+				{
+					fingerprint: "00000000000000001111-a-4-a",
+				},
+				{
 					fingerprint: "00000000000000001111-a-4-a",
 				},
 			},
@@ -136,14 +143,18 @@ func testBuilder(t test.Tester) {
 				{
 					fingerprint: "00000000000000001111-a-4-a",
 				},
+				{
+					fingerprint: "00000000000000001111-a-4-a",
+				},
+				{
+					fingerprint: "00000000000000001111-a-4-a",
+				},
 			},
 		},
 	}
 
 	for i, scenario := range scenarios {
-		builder := viewRequestBuilder{
-			operations: map[clientmodel.Fingerprint]ops{},
-		}
+		builder := NewViewRequestBuilder()
 
 		for _, atTime := range scenario.in.atTimes {
 			fingerprint := &clientmodel.Fingerprint{}
@@ -165,13 +176,14 @@ func testBuilder(t test.Tester) {
 
 		jobs := builder.ScanJobs()
 
-		if len(scenario.out) != len(jobs) {
-			t.Fatalf("%d. expected job length of %d, got %d", i, len(scenario.out), len(jobs))
+		if len(scenario.out) != jobs.Len() {
+			t.Fatalf("%d. expected job length of %d, got %d", i, len(scenario.out), jobs.Len())
 		}
 
 		for j, job := range scenario.out {
-			if jobs[j].fingerprint.String() != job.fingerprint {
-				t.Fatalf("%d.%d. expected fingerprint %s, got %s", i, j, job.fingerprint, jobs[j].fingerprint)
+			got := heap.Pop(&jobs).(*scanJob)
+			if got.fingerprint.String() != job.fingerprint {
+				t.Fatalf("%d.%d. expected fingerprint %s, got %s", i, j, job.fingerprint, got.fingerprint)
 			}
 		}
 	}
