@@ -27,15 +27,16 @@ type op interface {
 	// Fingerprint returns the fingerprint of the metric this operation
 	// operates on.
 	Fingerprint() *clientmodel.Fingerprint
-	// StartsAt returns the time at which this operation starts.
-	StartsAt() clientmodel.Timestamp
 	// ExtractSamples extracts samples from a stream of values and advances
 	// the operation time.
 	ExtractSamples(Values) Values
 	// Consumed returns whether the operator has consumed all data it needs.
 	Consumed() bool
-	// CurrentTime gets the current operation time, or nil if no subsequent
-	// work associated with this operator remains.
+	// CurrentTime gets the current operation time. In a newly created op,
+	// this is the starting time of the operation. During ongoing execution
+	// of the op, the current time is advanced accordingly. Once no
+	// subsequent work associated with the operation remains, nil is
+	// returned.
 	CurrentTime() clientmodel.Timestamp
 	// GreedierThan indicates whether this present operation should take
 	// precedence over the other operation due to greediness.
@@ -48,31 +49,36 @@ type op interface {
 // ops is a heap of operations, primary sorting key is the fingerprint.
 type ops []op
 
+// Len implements sort.Interface and heap.Interface.
 func (o ops) Len() int {
 	return len(o)
 }
 
-// Less compares the fingerprints. If they are equal, the comparison is
-// delegated to startsAtSort.
+// Less implements sort.Interface and heap.Interface. It compares the
+// fingerprints. If they are equal, the comparison is delegated to
+// currentTimeSort.
 func (o ops) Less(i, j int) bool {
 	fpi := o[i].Fingerprint()
 	fpj := o[j].Fingerprint()
 	if fpi.Equal(fpj) {
-		return startsAtSort{o}.Less(i, j)
+		return currentTimeSort{o}.Less(i, j)
 	}
 	return fpi.Less(fpj)
 }
 
+// Swap implements sort.Interface and heap.Interface.
 func (o ops) Swap(i, j int) {
 	o[i], o[j] = o[j], o[i]
 }
 
+// Push implements heap.Interface.
 func (o *ops) Push(x interface{}) {
 	// Push and Pop use pointer receivers because they modify the slice's
 	// length, not just its contents.
 	*o = append(*o, x.(op))
 }
 
+// Push implements heap.Interface.
 func (o *ops) Pop() interface{} {
 	old := *o
 	n := len(old)
@@ -81,15 +87,15 @@ func (o *ops) Pop() interface{} {
 	return x
 }
 
-// startsAtSort is a wrapper for ops with customized sorting order.
-type startsAtSort struct {
+// currentTimeSort is a wrapper for ops with customized sorting order.
+type currentTimeSort struct {
 	ops
 }
 
-// startsAtSort implements sort.Interface and sorts the operations in
-// chronological order by when they start.
-func (s startsAtSort) Less(i, j int) bool {
-	return s.ops[i].StartsAt().Before(s.ops[j].StartsAt())
+// currentTimeSort implements sort.Interface and sorts the operations in
+// chronological order by their current time.
+func (s currentTimeSort) Less(i, j int) bool {
+	return s.ops[i].CurrentTime().Before(s.ops[j].CurrentTime())
 }
 
 // greedinessSort is a wrapper for ops with customized sorting order.
@@ -103,31 +109,37 @@ func (g greedinessSort) Less(i, j int) bool {
 	return g.ops[i].GreedierThan(g.ops[j])
 }
 
+// baseOp contains the implementations and fields shared between different op
+// types.
+type baseOp struct {
+	fp      clientmodel.Fingerprint
+	current clientmodel.Timestamp
+}
+
+func (g *baseOp) Fingerprint() *clientmodel.Fingerprint {
+	return &g.fp
+}
+
+func (g *baseOp) CurrentTime() clientmodel.Timestamp {
+	return g.current
+}
+
 // getValuesAtTimeOp encapsulates getting values at or adjacent to a specific
 // time.
 type getValuesAtTimeOp struct {
-	fp       clientmodel.Fingerprint
-	time     clientmodel.Timestamp
+	baseOp
 	consumed bool
 }
 
 func (g *getValuesAtTimeOp) String() string {
-	return fmt.Sprintf("getValuesAtTimeOp at %s", g.time)
-}
-
-func (g *getValuesAtTimeOp) Fingerprint() *clientmodel.Fingerprint {
-	return &g.fp
-}
-
-func (g *getValuesAtTimeOp) StartsAt() clientmodel.Timestamp {
-	return g.time
+	return fmt.Sprintf("getValuesAtTimeOp at %s", g.current)
 }
 
 func (g *getValuesAtTimeOp) ExtractSamples(in Values) (out Values) {
 	if len(in) == 0 {
 		return
 	}
-	out = extractValuesAroundTime(g.time, in)
+	out = extractValuesAroundTime(g.current, in)
 	g.consumed = true
 	return
 }
@@ -145,10 +157,6 @@ func (g *getValuesAtTimeOp) GreedierThan(op op) (superior bool) {
 	return
 }
 
-func (g getValuesAtTimeOp) CurrentTime() clientmodel.Timestamp {
-	return g.time
-}
-
 func (g getValuesAtTimeOp) Consumed() bool {
 	return g.consumed
 }
@@ -156,22 +164,13 @@ func (g getValuesAtTimeOp) Consumed() bool {
 // getValuesAtIntervalOp encapsulates getting values at a given interval over a
 // duration.
 type getValuesAtIntervalOp struct {
-	fp       clientmodel.Fingerprint
-	from     clientmodel.Timestamp
+	baseOp
 	through  clientmodel.Timestamp
 	interval time.Duration
 }
 
 func (g *getValuesAtIntervalOp) String() string {
-	return fmt.Sprintf("getValuesAtIntervalOp from %s each %s through %s", g.from, g.interval, g.through)
-}
-
-func (g *getValuesAtIntervalOp) Fingerprint() *clientmodel.Fingerprint {
-	return &g.fp
-}
-
-func (g *getValuesAtIntervalOp) StartsAt() clientmodel.Timestamp {
-	return g.from
+	return fmt.Sprintf("getValuesAtIntervalOp from %s each %s through %s", g.current, g.interval, g.through)
 }
 
 func (g *getValuesAtIntervalOp) Through() clientmodel.Timestamp {
@@ -184,30 +183,26 @@ func (g *getValuesAtIntervalOp) ExtractSamples(in Values) (out Values) {
 	}
 	lastChunkTime := in[len(in)-1].Timestamp
 	for len(in) > 0 {
-		out = append(out, extractValuesAroundTime(g.from, in)...)
+		out = append(out, extractValuesAroundTime(g.current, in)...)
 		lastExtractedTime := out[len(out)-1].Timestamp
 		in = in.TruncateBefore(lastExtractedTime.Add(
 			clientmodel.MinimumTick))
-		g.from = g.from.Add(g.interval)
-		for !g.from.After(lastExtractedTime) {
-			g.from = g.from.Add(g.interval)
+		g.current = g.current.Add(g.interval)
+		for !g.current.After(lastExtractedTime) {
+			g.current = g.current.Add(g.interval)
 		}
 		if lastExtractedTime.Equal(lastChunkTime) {
 			break
 		}
-		if g.from.After(g.through) {
+		if g.current.After(g.through) {
 			break
 		}
 	}
 	return
 }
 
-func (g *getValuesAtIntervalOp) CurrentTime() clientmodel.Timestamp {
-	return g.from
-}
-
 func (g *getValuesAtIntervalOp) Consumed() bool {
-	return g.from.After(g.through)
+	return g.current.After(g.through)
 }
 
 func (g *getValuesAtIntervalOp) GreedierThan(op op) (superior bool) {
@@ -225,21 +220,12 @@ func (g *getValuesAtIntervalOp) GreedierThan(op op) (superior bool) {
 
 // getValuesAlongRangeOp encapsulates getting all values in a given range.
 type getValuesAlongRangeOp struct {
-	fp      clientmodel.Fingerprint
-	from    clientmodel.Timestamp
+	baseOp
 	through clientmodel.Timestamp
 }
 
 func (g *getValuesAlongRangeOp) String() string {
-	return fmt.Sprintf("getValuesAlongRangeOp from %s through %s", g.from, g.through)
-}
-
-func (g *getValuesAlongRangeOp) Fingerprint() *clientmodel.Fingerprint {
-	return &g.fp
-}
-
-func (g *getValuesAlongRangeOp) StartsAt() clientmodel.Timestamp {
-	return g.from
+	return fmt.Sprintf("getValuesAlongRangeOp from %s through %s", g.current, g.through)
 }
 
 func (g *getValuesAlongRangeOp) Through() clientmodel.Timestamp {
@@ -250,15 +236,15 @@ func (g *getValuesAlongRangeOp) ExtractSamples(in Values) (out Values) {
 	if len(in) == 0 {
 		return
 	}
-	// Find the first sample where time >= g.from.
+	// Find the first sample where time >= g.current.
 	firstIdx := sort.Search(len(in), func(i int) bool {
-		return !in[i].Timestamp.Before(g.from)
+		return !in[i].Timestamp.Before(g.current)
 	})
 	if firstIdx == len(in) {
 		// No samples at or after operator start time. This can only
 		// happen if we try applying the operator to a time after the
 		// last recorded sample. In this case, we're finished.
-		g.from = g.through.Add(clientmodel.MinimumTick)
+		g.current = g.through.Add(clientmodel.MinimumTick)
 		return
 	}
 
@@ -267,7 +253,7 @@ func (g *getValuesAlongRangeOp) ExtractSamples(in Values) (out Values) {
 		return in[i].Timestamp.After(g.through)
 	})
 	if lastIdx == firstIdx {
-		g.from = g.through.Add(clientmodel.MinimumTick)
+		g.current = g.through.Add(clientmodel.MinimumTick)
 		return
 	}
 
@@ -275,16 +261,12 @@ func (g *getValuesAlongRangeOp) ExtractSamples(in Values) (out Values) {
 	// Sample times are stored with a maximum time resolution of one second,
 	// so we have to add exactly that to target the next chunk on the next
 	// op iteration.
-	g.from = lastSampleTime.Add(time.Second)
+	g.current = lastSampleTime.Add(time.Second)
 	return in[firstIdx:lastIdx]
 }
 
-func (g *getValuesAlongRangeOp) CurrentTime() clientmodel.Timestamp {
-	return g.from
-}
-
 func (g *getValuesAlongRangeOp) Consumed() bool {
-	return g.from.After(g.through)
+	return g.current.After(g.through)
 }
 
 func (g *getValuesAlongRangeOp) GreedierThan(op op) (superior bool) {
@@ -307,8 +289,7 @@ func (g *getValuesAlongRangeOp) GreedierThan(op op) (superior bool) {
 // incremented by interval and from is reset to through-rangeDuration. Returns
 // current time nil when from > totalThrough.
 type getValueRangeAtIntervalOp struct {
-	fp            clientmodel.Fingerprint
-	rangeFrom     clientmodel.Timestamp
+	baseOp
 	rangeThrough  clientmodel.Timestamp
 	rangeDuration time.Duration
 	interval      time.Duration
@@ -316,15 +297,7 @@ type getValueRangeAtIntervalOp struct {
 }
 
 func (g *getValueRangeAtIntervalOp) String() string {
-	return fmt.Sprintf("getValueRangeAtIntervalOp range %s from %s each %s through %s", g.rangeDuration, g.rangeFrom, g.interval, g.through)
-}
-
-func (g *getValueRangeAtIntervalOp) Fingerprint() *clientmodel.Fingerprint {
-	return &g.fp
-}
-
-func (g *getValueRangeAtIntervalOp) StartsAt() clientmodel.Timestamp {
-	return g.rangeFrom
+	return fmt.Sprintf("getValueRangeAtIntervalOp range %s from %s each %s through %s", g.rangeDuration, g.current, g.interval, g.through)
 }
 
 func (g *getValueRangeAtIntervalOp) Through() clientmodel.Timestamp {
@@ -333,22 +306,22 @@ func (g *getValueRangeAtIntervalOp) Through() clientmodel.Timestamp {
 
 func (g *getValueRangeAtIntervalOp) advanceToNextInterval() {
 	g.rangeThrough = g.rangeThrough.Add(g.interval)
-	g.rangeFrom = g.rangeThrough.Add(-g.rangeDuration)
+	g.current = g.rangeThrough.Add(-g.rangeDuration)
 }
 
 func (g *getValueRangeAtIntervalOp) ExtractSamples(in Values) (out Values) {
 	if len(in) == 0 {
 		return
 	}
-	// Find the first sample where time >= g.from.
+	// Find the first sample where time >= g.current.
 	firstIdx := sort.Search(len(in), func(i int) bool {
-		return !in[i].Timestamp.Before(g.rangeFrom)
+		return !in[i].Timestamp.Before(g.current)
 	})
 	if firstIdx == len(in) {
-		// No samples at or after operator start time. This can only happen if we
-		// try applying the operator to a time after the last recorded sample. In
-		// this case, we're finished.
-		g.rangeFrom = g.through.Add(clientmodel.MinimumTick)
+		// No samples at or after operator start time. This can only
+		// happen if we try applying the operator to a time after the
+		// last recorded sample. In this case, we're finished.
+		g.current = g.through.Add(clientmodel.MinimumTick)
 		return
 	}
 
@@ -357,29 +330,25 @@ func (g *getValueRangeAtIntervalOp) ExtractSamples(in Values) (out Values) {
 		return in[i].Timestamp.After(g.rangeThrough)
 	})
 	// This only happens when there is only one sample and it is both after
-	// g.rangeFrom and after g.rangeThrough. In this case, both indexes are 0.
+	// g.current and after g.rangeThrough. In this case, both indexes are 0.
 	if lastIdx == firstIdx {
 		g.advanceToNextInterval()
 		return
 	}
 
 	lastSampleTime := in[lastIdx-1].Timestamp
-	// Sample times are stored with a maximum time resolution of one second, so
-	// we have to add exactly that to target the next chunk on the next op
-	// iteration.
-	g.rangeFrom = lastSampleTime.Add(time.Second)
-	if g.rangeFrom.After(g.rangeThrough) {
+	// Sample times are stored with a maximum time resolution of one second,
+	// so we have to add exactly that to target the next chunk on the next
+	// op iteration.
+	g.current = lastSampleTime.Add(time.Second)
+	if g.current.After(g.rangeThrough) {
 		g.advanceToNextInterval()
 	}
 	return in[firstIdx:lastIdx]
 }
 
-func (g *getValueRangeAtIntervalOp) CurrentTime() clientmodel.Timestamp {
-	return g.rangeFrom
-}
-
 func (g *getValueRangeAtIntervalOp) Consumed() bool {
-	return g.rangeFrom.After(g.through)
+	return g.current.After(g.through)
 }
 
 func (g *getValueRangeAtIntervalOp) GreedierThan(op op) bool {
@@ -518,7 +487,7 @@ func optimizeForwardGetValuesAtInterval(headOp *getValuesAtIntervalOp, unoptimiz
 	// If the last value was a scan at a given frequency along an interval,
 	// several optimizations may exist.
 	for _, peekOperation := range unoptimized {
-		if peekOperation.StartsAt().After(headOp.Through()) {
+		if peekOperation.CurrentTime().After(headOp.Through()) {
 			break
 		}
 
@@ -528,20 +497,20 @@ func optimizeForwardGetValuesAtInterval(headOp *getValuesAtIntervalOp, unoptimiz
 			if !next.GreedierThan(headOp) {
 				after := getValuesAtIntervalOp(*headOp)
 
-				headOp.through = next.from
+				headOp.through = next.current
 
 				// Truncate the get value at interval request if
 				// a range request cuts it off somewhere.
-				from := next.from
+				from := next.current
 
 				for !from.After(next.through) {
 					from = from.Add(headOp.interval)
 				}
 
-				after.from = from
+				after.current = from
 
 				unoptimized = append(ops{&after}, unoptimized...)
-				sort.Sort(startsAtSort{unoptimized})
+				sort.Sort(currentTimeSort{unoptimized})
 				return ops{headOp}, unoptimized
 			}
 		}
@@ -552,7 +521,7 @@ func optimizeForwardGetValuesAtInterval(headOp *getValuesAtIntervalOp, unoptimiz
 func optimizeForwardGetValuesAlongRange(headOp *getValuesAlongRangeOp, unoptimized ops) (ops, ops) {
 	optimized := ops{}
 	for _, peekOperation := range unoptimized {
-		if peekOperation.StartsAt().After(headOp.Through()) {
+		if peekOperation.CurrentTime().After(headOp.Through()) {
 			optimized = ops{headOp}
 			break
 		}
@@ -566,7 +535,7 @@ func optimizeForwardGetValuesAlongRange(headOp *getValuesAlongRangeOp, unoptimiz
 		case *getValuesAlongRangeOp:
 			// Range queries should be concatenated if they overlap.
 			if next.GreedierThan(headOp) {
-				next.from = headOp.from
+				next.current = headOp.current
 				return optimized, unoptimized
 			}
 			optimized = ops{headOp}
@@ -576,13 +545,13 @@ func optimizeForwardGetValuesAlongRange(headOp *getValuesAlongRangeOp, unoptimiz
 			unoptimized = unoptimized[1:]
 
 			if next.GreedierThan(headOp) {
-				nextStart := next.from
+				nextStart := next.current
 
 				for !nextStart.After(headOp.through) {
 					nextStart = nextStart.Add(next.interval)
 				}
 
-				next.from = nextStart
+				next.current = nextStart
 				unoptimized = append(ops{next}, unoptimized...)
 			}
 		default:
@@ -599,7 +568,7 @@ func selectQueriesForTime(time clientmodel.Timestamp, queries ops) (out ops) {
 		return
 	}
 
-	if !queries[0].StartsAt().Equal(time) {
+	if !queries[0].CurrentTime().Equal(time) {
 		return
 	}
 
@@ -737,22 +706,22 @@ func rewriteForRangeAndInterval(greediestRange durationOperator, greediestInterv
 			continue
 		}
 
-		// The range operation does not exceed interval.  Leave a snippet of
-		// interval.
+		// The range operation does not exceed interval.  Leave a
+		// snippet of interval.
 		var (
 			truncated            = op.(*getValuesAtIntervalOp)
 			newIntervalOperation getValuesAtIntervalOp
 			// Refactor
-			remainingSlice    = greediestRange.Through().Sub(greediestRange.StartsAt()) / time.Second
+			remainingSlice    = greediestRange.Through().Sub(greediestRange.CurrentTime()) / time.Second
 			nextIntervalPoint = time.Duration(math.Ceil(float64(remainingSlice)/float64(truncated.interval)) * float64(truncated.interval/time.Second))
 			nextStart         = greediestRange.Through().Add(nextIntervalPoint)
 		)
 
-		newIntervalOperation.from = nextStart
+		newIntervalOperation.current = nextStart
 		newIntervalOperation.interval = truncated.interval
 		newIntervalOperation.through = truncated.Through()
-		// Added back to the pending because additional curation could be
-		// necessary.
+		// Added back to the pending because additional curation could
+		// be necessary.
 		out = append(out, &newIntervalOperation)
 	}
 
@@ -792,12 +761,12 @@ func optimizeTimeGroups(pending ops) (out ops) {
 		return
 	}
 
-	sort.Sort(startsAtSort{pending})
+	sort.Sort(currentTimeSort{pending})
 
 	var (
 		nextOperation  = pending[0]
 		groupedQueries = selectQueriesForTime(
-			nextOperation.StartsAt(), pending)
+			nextOperation.CurrentTime(), pending)
 	)
 
 	out = optimizeTimeGroup(groupedQueries)

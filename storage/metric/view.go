@@ -81,7 +81,7 @@ var getValuesAtTimes = newValueAtTimeList(10 * 1024)
 func (v *viewRequestBuilder) GetMetricAtTime(fp *clientmodel.Fingerprint, time clientmodel.Timestamp) {
 	op, _ := getValuesAtTimes.Get()
 	op.fp = *fp
-	op.time = time
+	op.current = time
 	heap.Push(&v.operations, op)
 }
 
@@ -91,7 +91,7 @@ var getValuesAtIntervals = newValueAtIntervalList(10 * 1024)
 func (v *viewRequestBuilder) GetMetricAtInterval(fp *clientmodel.Fingerprint, from, through clientmodel.Timestamp, interval time.Duration) {
 	op, _ := getValuesAtIntervals.Get()
 	op.fp = *fp
-	op.from = from
+	op.current = from
 	op.through = through
 	op.interval = interval
 	heap.Push(&v.operations, op)
@@ -103,7 +103,7 @@ var getValuesAlongRanges = newValueAlongRangeList(10 * 1024)
 func (v *viewRequestBuilder) GetMetricRange(fp *clientmodel.Fingerprint, from, through clientmodel.Timestamp) {
 	op, _ := getValuesAlongRanges.Get()
 	op.fp = *fp
-	op.from = from
+	op.current = from
 	op.through = through
 	heap.Push(&v.operations, op)
 }
@@ -114,7 +114,7 @@ var getValuesAtIntervalAlongRanges = newValueAtIntervalAlongRangeList(10 * 1024)
 func (v *viewRequestBuilder) GetMetricRangeAtInterval(fp *clientmodel.Fingerprint, from, through clientmodel.Timestamp, interval, rangeDuration time.Duration) {
 	op, _ := getValuesAtIntervalAlongRanges.Get()
 	op.fp = *fp
-	op.rangeFrom = from
+	op.current = from
 	op.rangeThrough = from.Add(rangeDuration)
 	op.rangeDuration = rangeDuration
 	op.interval = interval
