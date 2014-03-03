@@ -46,6 +46,13 @@ type op interface {
 	GreedierThan(op) bool
 }
 
+// durationOperator encapsulates a general operation that occurs over a
+// duration.
+type durationOperator interface {
+	op
+	Through() clientmodel.Timestamp
+}
+
 // ops is a heap of operations, primary sorting key is the fingerprint.
 type ops []op
 
@@ -355,36 +362,9 @@ func (g *getValueRangeAtIntervalOp) GreedierThan(op op) bool {
 	panic("not implemented")
 }
 
-// Provides a collection of getMetricRangeOperation.
-type getMetricRangeOperations []*getValuesAlongRangeOp
-
-func (s getMetricRangeOperations) Len() int {
-	return len(s)
-}
-
-func (s getMetricRangeOperations) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-// Sorts getMetricRangeOperation according to duration in descending order.
-type rangeDurationSorter struct {
-	getMetricRangeOperations
-}
-
-func (s rangeDurationSorter) Less(i, j int) bool {
-	l := s.getMetricRangeOperations[i]
-	r := s.getMetricRangeOperations[j]
-
-	return !l.through.Before(r.through)
-}
-
-// Encapsulates a general operation that occurs over a duration.
-type durationOperator interface {
-	op
-	Through() clientmodel.Timestamp
-}
-
-// Contains getValuesAtIntervalOp operations.
+// getValuesAtIntervalOps contains getValuesAtIntervalOp operations. It
+// implements sort.Interface and sorts the operations in ascending order by
+// their frequency.
 type getValuesAtIntervalOps []*getValuesAtIntervalOp
 
 func (s getValuesAtIntervalOps) Len() int {
@@ -395,29 +375,35 @@ func (s getValuesAtIntervalOps) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
-// Sorts durationOperator by the operation's duration in descending order.
-type intervalDurationSorter struct {
-	getValuesAtIntervalOps
+func (s getValuesAtIntervalOps) Less(i, j int) bool {
+	return s[i].interval < s[j].interval
 }
 
-func (s intervalDurationSorter) Less(i, j int) bool {
-	l := s.getValuesAtIntervalOps[i]
-	r := s.getValuesAtIntervalOps[j]
-
-	return !l.through.Before(r.through)
-}
-
-// Sorts getValuesAtIntervalOp operations in ascending order by their
-// frequency.
-type frequencySorter struct {
-	getValuesAtIntervalOps
-}
-
-func (s frequencySorter) Less(i, j int) bool {
-	l := s.getValuesAtIntervalOps[i]
-	r := s.getValuesAtIntervalOps[j]
-
-	return l.interval < r.interval
+// extractValuesAroundTime searches for the provided time in the list of
+// available samples and emits a slice containing the data points that
+// are adjacent to it.
+//
+// An assumption of this is that the provided samples are already sorted!
+func extractValuesAroundTime(t clientmodel.Timestamp, in Values) Values {
+	i := sort.Search(len(in), func(i int) bool {
+		return !in[i].Timestamp.Before(t)
+	})
+	if i == len(in) {
+		// Target time is past the end, return only the last sample.
+		return in[len(in)-1:]
+	}
+	if in[i].Timestamp.Equal(t) && len(in) > i+1 {
+		// We hit exactly the current sample time. Very unlikely in
+		// practice.  Return only the current sample.
+		return in[i : i+1]
+	}
+	if i == 0 {
+		// We hit before the first sample time. Return only the first
+		// sample.
+		return in[0:1]
+	}
+	// We hit between two samples. Return both surrounding samples.
+	return in[i-1 : i+1]
 }
 
 // Selects and returns all operations that are getValuesAtIntervalOp operations
@@ -660,7 +646,7 @@ func rewriteForGreediestInterval(greediestIntervals map[time.Duration]durationOp
 		memo = append(memo, o.(*getValuesAtIntervalOp))
 	}
 
-	sort.Sort(frequencySorter{memo})
+	sort.Sort(memo)
 
 	for _, o := range memo {
 		out = append(out, o)
@@ -779,31 +765,4 @@ func optimizeTimeGroups(pending ops) (out ops) {
 
 func optimize(pending ops) (out ops) {
 	return optimizeForward(optimizeTimeGroups(pending))
-}
-
-// extractValuesAroundTime searches for the provided time in the list of
-// available samples and emits a slice containing the data points that
-// are adjacent to it.
-//
-// An assumption of this is that the provided samples are already sorted!
-func extractValuesAroundTime(t clientmodel.Timestamp, in Values) Values {
-	i := sort.Search(len(in), func(i int) bool {
-		return !in[i].Timestamp.Before(t)
-	})
-	if i == len(in) {
-		// Target time is past the end, return only the last sample.
-		return in[len(in)-1:]
-	}
-	if in[i].Timestamp.Equal(t) && len(in) > i+1 {
-		// We hit exactly the current sample time. Very unlikely in
-		// practice.  Return only the current sample.
-		return in[i : i+1]
-	}
-	if i == 0 {
-		// We hit before the first sample time. Return only the first
-		// sample.
-		return in[0:1]
-	}
-	// We hit between two samples. Return both surrounding samples.
-	return in[i-1 : i+1]
 }
