@@ -420,19 +420,19 @@ func (t *TieredStorage) renderView(viewJob viewJob) {
 	defer t.dtoSampleKeys.Give(sampleKeyDto)
 
 	extractionTimer := viewJob.stats.GetTimer(stats.ViewDataExtractionTime).Start()
-	for viewJob.builder.HasScanJobs() {
-		scanJob := viewJob.builder.PopScanJob()
-		op := scanJob.operation
-		old, err := t.seriesTooOld(&scanJob.fingerprint, op.CurrentTime())
+	for viewJob.builder.HasOp() {
+		op := viewJob.builder.PopOp()
+		fp := op.Fingerprint()
+		old, err := t.seriesTooOld(fp, op.CurrentTime())
 		if err != nil {
-			glog.Errorf("Error getting watermark from cache for %s: %s", scanJob.fingerprint, err)
+			glog.Errorf("Error getting watermark from cache for %s: %s", fp, err)
 			continue
 		}
 		if old {
 			continue
 		}
 
-		memValues := t.memoryArena.CloneSamples(&scanJob.fingerprint)
+		memValues := t.memoryArena.CloneSamples(fp)
 
 		// Abort the view rendering if the caller (MakeView) has timed out.
 		if len(viewJob.abort) > 0 {
@@ -473,7 +473,7 @@ func (t *TieredStorage) renderView(viewJob viewJob) {
 				diskTimer := viewJob.stats.GetTimer(stats.ViewDiskExtractionTime).Start()
 				diskValues, expired := t.loadChunkAroundTime(
 					iterator,
-					&scanJob.fingerprint,
+					fp,
 					targetTime,
 					firstBlock,
 					lastBlock,
@@ -517,7 +517,7 @@ func (t *TieredStorage) renderView(viewJob viewJob) {
 		// Extract all needed data from the current chunk and append the
 		// extracted samples to the materialized view.
 		for !op.Consumed() && !op.CurrentTime().After(targetTime) {
-			view.appendSamples(&scanJob.fingerprint, op.ExtractSamples(Values(currentChunk)))
+			view.appendSamples(fp, op.ExtractSamples(Values(currentChunk)))
 		}
 	}
 	extractionTimer.Stop()

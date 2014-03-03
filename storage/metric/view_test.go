@@ -174,12 +174,12 @@ func testBuilder(t test.Tester) {
 		}
 
 		for j, job := range scenario.out {
-			got := builder.PopScanJob()
-			if got.fingerprint.String() != job.fingerprint {
-				t.Errorf("%d.%d. expected fingerprint %s, got %s", i, j, job.fingerprint, got.fingerprint)
+			got := builder.PopOp()
+			if got.Fingerprint().String() != job.fingerprint {
+				t.Errorf("%d.%d. expected fingerprint %s, got %s", i, j, job.fingerprint, got.Fingerprint())
 			}
 		}
-		if builder.HasScanJobs() {
+		if builder.HasOp() {
 			t.Error("Expected builder to have no scan jobs left.")
 		}
 	}
