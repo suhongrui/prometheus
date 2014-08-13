@@ -2,6 +2,7 @@ package storage_ng
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
@@ -29,7 +30,7 @@ const (
 
 	indexFormatVersion = 1
 	indexMagicString   = "PrometheusIndexes"
-	indexBufSize       = 1 << 15 // 32kiB. TODO: Tweak.
+	indexBufSize       = 1 << 18 // 256kiB. TODO: Tweak.
 
 	chunkHeaderLen             = 17
 	chunkHeaderTypeOffset      = 0
@@ -245,7 +246,8 @@ func (p *diskPersistence) indexPath() string {
 //     clientmodel.LabelValue -> string
 //     clientmodel.Fingerprint -> uint64
 //
-// Description of the on-disk format:
+// This method persists all indexes to one gzip compressed file with the
+// following format (prior to compression):
 //
 // Label names and label values are encoded as their varint-encoded length
 // followed by their byte sequence.
@@ -279,7 +281,8 @@ func (p *diskPersistence) PersistIndexes(i *Indexes) error {
 
 	p.setBufLen(binary.MaxVarintLen64)
 
-	w := bufio.NewWriterSize(f, indexBufSize)
+	compressor := gzip.NewWriter(f)
+	w := bufio.NewWriterSize(compressor, indexBufSize)
 	if _, err := w.WriteString(indexMagicString); err != nil {
 		return err
 	}
@@ -297,7 +300,10 @@ func (p *diskPersistence) PersistIndexes(i *Indexes) error {
 		return err
 	}
 
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return compressor.Close()
 }
 
 func (p *diskPersistence) persistVarint(w io.Writer, i int) error {
@@ -410,7 +416,11 @@ func (p *diskPersistence) LoadIndexes() (*Indexes, error) {
 	}
 	defer f.Close()
 
-	r := bufio.NewReaderSize(f, indexBufSize)
+	decompressor, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	r := bufio.NewReaderSize(decompressor, indexBufSize)
 
 	p.setBufLen(len(indexMagicString))
 	if _, err := io.ReadFull(r, p.buf); err != nil {
@@ -439,7 +449,7 @@ func (p *diskPersistence) LoadIndexes() (*Indexes, error) {
 		return nil, err
 	}
 
-	return i, nil
+	return i, decompressor.Close()
 }
 
 func (p *diskPersistence) loadFingerprintToSeries(r *bufio.Reader, i *Indexes) error {
