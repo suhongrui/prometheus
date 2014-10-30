@@ -86,8 +86,8 @@ type persistence struct {
 	basePath string
 	chunkLen int
 
-	// archiveMtx protects the archiving-related methods ArchiveMetric,
-	// UnarchiveMetric, DropArchiveMetric, and GetFingerprintsModifiedBefore
+	// archiveMtx protects the archiving-related methods archiveMetric,
+	// unarchiveMetric, dropArchiveMetric, and getFingerprintsModifiedBefore
 	// from concurrent calls.
 	archiveMtx sync.Mutex
 
@@ -666,7 +666,7 @@ func (p *persistence) dropChunks(fp clientmodel.Fingerprint, beforeTime clientmo
 // getFingerprintsForLabelPair, getLabelValuesForLabelName, and
 // getFingerprintsModifiedBefore.  If the queue is full, this method blocks
 // until the metric can be queued.  This method is goroutine-safe.
-func (p *persistence) indexMetric(m clientmodel.Metric, fp clientmodel.Fingerprint) {
+func (p *persistence) indexMetric(fp clientmodel.Fingerprint, m clientmodel.Metric) {
 	p.indexingQueue <- indexingOp{fp, m, add}
 }
 
@@ -677,7 +677,7 @@ func (p *persistence) indexMetric(m clientmodel.Metric, fp clientmodel.Fingerpri
 // archived metric. To drop an archived metric, call dropArchivedFingerprint.)
 // If the queue is full, this method blocks until the metric can be queued. This
 // method is goroutine-safe.
-func (p *persistence) unindexMetric(m clientmodel.Metric, fp clientmodel.Fingerprint) {
+func (p *persistence) unindexMetric(fp clientmodel.Fingerprint, m clientmodel.Metric) {
 	p.indexingQueue <- indexingOp{fp, m, remove}
 }
 
@@ -775,7 +775,7 @@ func (p *persistence) dropArchivedMetric(fp clientmodel.Fingerprint) error {
 	if err := p.archivedFingerprintToTimeRange.Delete(codable.Fingerprint(fp)); err != nil {
 		return err
 	}
-	p.unindexMetric(metric, fp)
+	p.unindexMetric(fp, metric)
 	return nil
 }
 

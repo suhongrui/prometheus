@@ -29,8 +29,9 @@ func TestGetFingerprintsForLabelMatchers(t *testing.T) {
 
 }
 
+// TestLoop is just a smoke test for the loop method, if we can switch it on and
+// off without disaster.
 func TestLoop(t *testing.T) {
-	// Just a smoke test for the loop method.
 	samples := make(clientmodel.Samples, 1000)
 	for i := range samples {
 		samples[i] = &clientmodel.Sample{
@@ -303,6 +304,127 @@ func TestGetRangeValues(t *testing.T) {
 	})
 	if len(actual) != 0 {
 		t.Fatalf("5.3. Expected no results, got %d.", len(actual))
+	}
+}
+
+func TestEvictAndPurgeSeries(t *testing.T) {
+	samples := make(clientmodel.Samples, 1000)
+	for i := range samples {
+		samples[i] = &clientmodel.Sample{
+			Timestamp: clientmodel.Timestamp(2 * i),
+			Value:     clientmodel.SampleValue(float64(i) * 0.2),
+		}
+	}
+	s, closer := NewTestStorage(t)
+	defer closer.Close()
+
+	ms := s.(*memorySeriesStorage) // Going to test the internal purgeSeries method.
+
+	s.AppendSamples(samples)
+
+	fp := clientmodel.Metric{}.Fingerprint()
+
+	// Purge ~half of the chunks.
+	ms.purgeSeries(fp, 1000)
+	it := s.NewIterator(fp)
+	actual := it.GetBoundaryValues(metric.Interval{
+		OldestInclusive: 0,
+		NewestInclusive: 10000,
+	})
+	if len(actual) != 2 {
+		t.Fatal("expected two results after purging half of series")
+	}
+	if actual[0].Timestamp < 800 || actual[0].Timestamp > 1000 {
+		t.Errorf("1st timestamp out of expected range: %v", actual[0].Timestamp)
+	}
+	want := clientmodel.Timestamp(1998)
+	if actual[1].Timestamp != want {
+		t.Errorf("2nd timestamp: want %v, got %v", want, actual[1].Timestamp)
+	}
+
+	// Purge everything.
+	ms.purgeSeries(fp, 10000)
+	it = s.NewIterator(fp)
+	actual = it.GetBoundaryValues(metric.Interval{
+		OldestInclusive: 0,
+		NewestInclusive: 10000,
+	})
+	if len(actual) != 0 {
+		t.Fatal("expected zero results after purging the whole series")
+	}
+
+	// Recreate series.
+	s.AppendSamples(samples)
+
+	series, ok := ms.fpToSeries.get(fp)
+	if !ok {
+		t.Fatal("could not find series")
+	}
+
+	// Evict everything except head chunk.
+	allEvicted, persistHeadChunk := series.evictOlderThan(1998)
+	// Head chunk not yet old enough, should get false, false:
+	if allEvicted {
+		t.Error("allEvicted with head chunk not yet old enough")
+	}
+	if persistHeadChunk {
+		t.Error("persistHeadChunk although head chunk is not old enough")
+	}
+	// Evict everything.
+	allEvicted, persistHeadChunk = series.evictOlderThan(10000)
+	// Since the head chunk is not yet persisted, we should get false, true:
+	if allEvicted {
+		t.Error("allEvicted with head chuk not yet persisted")
+	}
+	if !persistHeadChunk {
+		t.Error("not persistHeadChunk although head chunk is old enough")
+	}
+	// Persist head chunk as requested.
+	ms.persistQueue <- persistRequest{fp, series.head()}
+	time.Sleep(time.Second) // Give time for persisting to happen.
+	allEvicted, persistHeadChunk = series.evictOlderThan(10000)
+	// Now we should really see everything gone.
+	if !allEvicted {
+		t.Error("not allEvicted")
+	}
+	if persistHeadChunk {
+		t.Error("persistHeadChunk although already persisted")
+	}
+
+	// Now archive as it would usually be done in the evictTicker loop.
+	ms.fpToSeries.del(fp)
+	if err := ms.persistence.archiveMetric(
+		fp, series.metric, series.firstTime(), series.lastTime(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	archived, _, _, err := ms.persistence.hasArchivedMetric(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !archived {
+		t.Fatal("not archived")
+	}
+
+	// Purge ~half of the chunks of an archived series.
+	ms.purgeSeries(fp, 1000)
+	archived, _, _, err = ms.persistence.hasArchivedMetric(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !archived {
+		t.Fatal("archived series dropped although only half of the chunks purged")
+	}
+
+	// Purge everything.
+	ms.purgeSeries(fp, 10000)
+	archived, _, _, err = ms.persistence.hasArchivedMetric(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived {
+		t.Fatal("archived series not dropped")
 	}
 }
 
