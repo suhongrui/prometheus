@@ -362,33 +362,33 @@ func TestEvictAndPurgeSeries(t *testing.T) {
 	}
 
 	// Evict everything except head chunk.
-	allEvicted, persistHeadChunk := series.evictOlderThan(1998)
+	allEvicted, headChunkToPersist := series.evictOlderThan(1998)
 	// Head chunk not yet old enough, should get false, false:
 	if allEvicted {
 		t.Error("allEvicted with head chunk not yet old enough")
 	}
-	if persistHeadChunk {
-		t.Error("persistHeadChunk although head chunk is not old enough")
+	if headChunkToPersist != nil {
+		t.Error("persistHeadChunk is not nil although head chunk is not old enough")
 	}
 	// Evict everything.
-	allEvicted, persistHeadChunk = series.evictOlderThan(10000)
+	allEvicted, headChunkToPersist = series.evictOlderThan(10000)
 	// Since the head chunk is not yet persisted, we should get false, true:
 	if allEvicted {
 		t.Error("allEvicted with head chuk not yet persisted")
 	}
-	if !persistHeadChunk {
-		t.Error("not persistHeadChunk although head chunk is old enough")
+	if headChunkToPersist == nil {
+		t.Error("headChunkToPersist is nil although head chunk is old enough")
 	}
 	// Persist head chunk as requested.
 	ms.persistQueue <- persistRequest{fp, series.head()}
 	time.Sleep(time.Second) // Give time for persisting to happen.
-	allEvicted, persistHeadChunk = series.evictOlderThan(10000)
+	allEvicted, headChunkToPersist = series.evictOlderThan(10000)
 	// Now we should really see everything gone.
 	if !allEvicted {
 		t.Error("not allEvicted")
 	}
-	if persistHeadChunk {
-		t.Error("persistHeadChunk although already persisted")
+	if headChunkToPersist != nil {
+		t.Error("headChunkToPersist is not nil although already persisted")
 	}
 
 	// Now archive as it would usually be done in the evictTicker loop.
@@ -448,17 +448,22 @@ func BenchmarkAppend(b *testing.B) {
 	s.AppendSamples(samples)
 }
 
+// Append a large number of random samples and then check if we can get them out
+// of the storage alright.
 func TestFuzz(t *testing.T) {
-	r := rand.New(rand.NewSource(42))
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
 
-	check := func() bool {
+	check := func(seed int64) bool {
+		rand.Seed(seed)
 		s, c := NewTestStorage(t)
 		defer c.Close()
 
-		samples := createRandomSamples(r)
+		samples := createRandomSamples()
 		s.AppendSamples(samples)
 
-		return verifyStorage(t, s, samples, r)
+		return verifyStorage(t, s, samples, 24*7*time.Hour)
 	}
 
 	if err := quick.Check(check, nil); err != nil {
@@ -466,7 +471,55 @@ func TestFuzz(t *testing.T) {
 	}
 }
 
-func createRandomSamples(r *rand.Rand) clientmodel.Samples {
+// BenchmarkFuzz is the benchmark version TestFuzz. However, it will run several
+// append and verify operations in parallel, if GOMAXPROC is set
+// accordingly. Also, the storage options are set such that evictions,
+// checkpoints, and purging will happen concurrently, too. This benchmark will
+// have a very long runtime (up to minutes). You can use it as an actual
+// benchmark. Run it like this:
+//
+// go test -cpu 1,2,4,8 -short -bench BenchmarkFuzz -benchmem
+//
+// You can also use it as a test for races. In that case, run it like this (will
+// make things even slower):
+//
+// go test -race -cpu 8 -short -bench BenchmarkFuzz
+func BenchmarkFuzz(b *testing.B) {
+	b.StopTimer()
+	rand.Seed(42)
+	directory := test.NewTemporaryDirectory("test_storage", b)
+	defer directory.Close()
+	o := &MemorySeriesStorageOptions{
+		MemoryEvictionInterval:     time.Second,
+		MemoryRetentionPeriod:      10 * time.Minute,
+		PersistencePurgeInterval:   10 * time.Second,
+		PersistenceRetentionPeriod: time.Hour,
+		PersistenceStoragePath:     directory.Path(),
+		CheckpointInterval:         3 * time.Second,
+	}
+	s, err := NewMemorySeriesStorage(o)
+	if err != nil {
+		b.Fatalf("Error creating storage: %s", err)
+	}
+	s.Start()
+	defer s.Stop()
+	b.StartTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		var allSamples clientmodel.Samples
+		for pb.Next() {
+			newSamples := createRandomSamples()
+			allSamples = append(allSamples, newSamples[:len(newSamples)/2]...)
+			s.AppendSamples(newSamples[:len(newSamples)/2])
+			verifyStorage(b, s, allSamples, o.PersistenceRetentionPeriod)
+			allSamples = append(allSamples, newSamples[len(newSamples)/2:]...)
+			s.AppendSamples(newSamples[len(newSamples)/2:])
+			verifyStorage(b, s, allSamples, o.PersistenceRetentionPeriod)
+		}
+	})
+}
+
+func createRandomSamples() clientmodel.Samples {
 	type valueCreator func() clientmodel.SampleValue
 	type deltaApplier func(clientmodel.SampleValue) clientmodel.SampleValue
 
@@ -474,49 +527,49 @@ func createRandomSamples(r *rand.Rand) clientmodel.Samples {
 		maxMetrics         = 5
 		maxCycles          = 500
 		maxStreakLength    = 500
-		timestamp          = time.Now().Unix()
 		maxTimeDelta       = 1000
 		maxTimeDeltaFactor = 10
+		timestamp          = clientmodel.Now() - clientmodel.Timestamp(maxTimeDelta*maxTimeDeltaFactor*maxCycles*maxStreakLength/16) // So that some timestamps are in the future.
 		generators         = []struct {
 			createValue valueCreator
 			applyDelta  []deltaApplier
 		}{
 			{ // "Boolean".
 				createValue: func() clientmodel.SampleValue {
-					return clientmodel.SampleValue(r.Intn(2))
+					return clientmodel.SampleValue(rand.Intn(2))
 				},
 				applyDelta: []deltaApplier{
 					func(_ clientmodel.SampleValue) clientmodel.SampleValue {
-						return clientmodel.SampleValue(r.Intn(2))
+						return clientmodel.SampleValue(rand.Intn(2))
 					},
 				},
 			},
 			{ // Integer with int deltas of various byte length.
 				createValue: func() clientmodel.SampleValue {
-					return clientmodel.SampleValue(r.Int63() - 1<<62)
+					return clientmodel.SampleValue(rand.Int63() - 1<<62)
 				},
 				applyDelta: []deltaApplier{
 					func(v clientmodel.SampleValue) clientmodel.SampleValue {
-						return clientmodel.SampleValue(r.Intn(1<<8) - 1<<7 + int(v))
+						return clientmodel.SampleValue(rand.Intn(1<<8) - 1<<7 + int(v))
 					},
 					func(v clientmodel.SampleValue) clientmodel.SampleValue {
-						return clientmodel.SampleValue(r.Intn(1<<16) - 1<<15 + int(v))
+						return clientmodel.SampleValue(rand.Intn(1<<16) - 1<<15 + int(v))
 					},
 					func(v clientmodel.SampleValue) clientmodel.SampleValue {
-						return clientmodel.SampleValue(r.Intn(1<<32) - 1<<31 + int(v))
+						return clientmodel.SampleValue(rand.Intn(1<<32) - 1<<31 + int(v))
 					},
 				},
 			},
 			{ // Float with float32 and float64 deltas.
 				createValue: func() clientmodel.SampleValue {
-					return clientmodel.SampleValue(r.NormFloat64())
+					return clientmodel.SampleValue(rand.NormFloat64())
 				},
 				applyDelta: []deltaApplier{
 					func(v clientmodel.SampleValue) clientmodel.SampleValue {
-						return v + clientmodel.SampleValue(float32(r.NormFloat64()))
+						return v + clientmodel.SampleValue(float32(rand.NormFloat64()))
 					},
 					func(v clientmodel.SampleValue) clientmodel.SampleValue {
-						return v + clientmodel.SampleValue(r.NormFloat64())
+						return v + clientmodel.SampleValue(rand.NormFloat64())
 					},
 				},
 			},
@@ -526,55 +579,55 @@ func createRandomSamples(r *rand.Rand) clientmodel.Samples {
 	result := clientmodel.Samples{}
 
 	metrics := []clientmodel.Metric{}
-	for n := r.Intn(maxMetrics); n >= 0; n-- {
+	for n := rand.Intn(maxMetrics); n >= 0; n-- {
 		metrics = append(metrics, clientmodel.Metric{
-			clientmodel.LabelName(fmt.Sprintf("labelname_%d", n+1)): clientmodel.LabelValue(fmt.Sprintf("labelvalue_%d", n+1)),
+			clientmodel.LabelName(fmt.Sprintf("labelname_%d", n+1)): clientmodel.LabelValue(fmt.Sprintf("labelvalue_%d", rand.Int())),
 		})
 	}
 
-	for n := r.Intn(maxCycles); n >= 0; n-- {
+	for n := rand.Intn(maxCycles); n >= 0; n-- {
 		// Pick a metric for this cycle.
-		metric := metrics[r.Intn(len(metrics))]
-		timeDelta := r.Intn(maxTimeDelta) + 1
-		generator := generators[r.Intn(len(generators))]
+		metric := metrics[rand.Intn(len(metrics))]
+		timeDelta := rand.Intn(maxTimeDelta) + 1
+		generator := generators[rand.Intn(len(generators))]
 		createValue := generator.createValue
-		applyDelta := generator.applyDelta[r.Intn(len(generator.applyDelta))]
-		incTimestamp := func() { timestamp += int64(timeDelta * (r.Intn(maxTimeDeltaFactor) + 1)) }
-		switch r.Intn(4) {
+		applyDelta := generator.applyDelta[rand.Intn(len(generator.applyDelta))]
+		incTimestamp := func() { timestamp += clientmodel.Timestamp(timeDelta * (rand.Intn(maxTimeDeltaFactor) + 1)) }
+		switch rand.Intn(4) {
 		case 0: // A single sample.
 			result = append(result, &clientmodel.Sample{
 				Metric:    metric,
 				Value:     createValue(),
-				Timestamp: clientmodel.TimestampFromUnix(timestamp),
+				Timestamp: timestamp,
 			})
 			incTimestamp()
 		case 1: // A streak of random sample values.
-			for n := r.Intn(maxStreakLength); n >= 0; n-- {
+			for n := rand.Intn(maxStreakLength); n >= 0; n-- {
 				result = append(result, &clientmodel.Sample{
 					Metric:    metric,
 					Value:     createValue(),
-					Timestamp: clientmodel.TimestampFromUnix(timestamp),
+					Timestamp: timestamp,
 				})
 				incTimestamp()
 			}
 		case 2: // A streak of sample values with incremental changes.
 			value := createValue()
-			for n := r.Intn(maxStreakLength); n >= 0; n-- {
+			for n := rand.Intn(maxStreakLength); n >= 0; n-- {
 				result = append(result, &clientmodel.Sample{
 					Metric:    metric,
 					Value:     value,
-					Timestamp: clientmodel.TimestampFromUnix(timestamp),
+					Timestamp: timestamp,
 				})
 				incTimestamp()
 				value = applyDelta(value)
 			}
 		case 3: // A streak of constant sample values.
 			value := createValue()
-			for n := r.Intn(maxStreakLength); n >= 0; n-- {
+			for n := rand.Intn(maxStreakLength); n >= 0; n-- {
 				result = append(result, &clientmodel.Sample{
 					Metric:    metric,
 					Value:     value,
-					Timestamp: clientmodel.TimestampFromUnix(timestamp),
+					Timestamp: timestamp,
 				})
 				incTimestamp()
 			}
@@ -584,28 +637,36 @@ func createRandomSamples(r *rand.Rand) clientmodel.Samples {
 	return result
 }
 
-func verifyStorage(t *testing.T, s Storage, samples clientmodel.Samples, r *rand.Rand) bool {
-	iters := map[clientmodel.Fingerprint]SeriesIterator{}
+func verifyStorage(t testing.TB, s Storage, samples clientmodel.Samples, maxAge time.Duration) bool {
 	result := true
-	for _, i := range r.Perm(len(samples)) {
+	for _, i := range rand.Perm(len(samples)) {
 		sample := samples[i]
-		fp := sample.Metric.Fingerprint()
-		iter, ok := iters[fp]
-		if !ok {
-			iter = s.NewIterator(fp)
-			iters[fp] = iter
+		if sample.Timestamp.Before(clientmodel.TimestampFromTime(time.Now().Add(-maxAge))) {
+			continue
+			// TODO: Once we have a guaranteed cutoff at the
+			// retention period, we can verify here that no results
+			// are returned.
 		}
-		found := iter.GetValueAtTime(sample.Timestamp)
+		fp := sample.Metric.Fingerprint()
+		p := s.NewPreloader()
+		p.PreloadRange(fp, sample.Timestamp, sample.Timestamp, time.Hour)
+		found := s.NewIterator(fp).GetValueAtTime(sample.Timestamp)
 		if len(found) != 1 {
-			t.Errorf("Expected exactly one value, found %d.", len(found))
-			return false
+			t.Errorf("Sample %#v: Expected exactly one value, found %d.", sample, len(found))
+			result = false
+			p.Close()
+			continue
 		}
 		want := float64(sample.Value)
 		got := float64(found[0].Value)
-		if want != got {
-			t.Errorf("Value mismatch, want %f, got %f.", want, got)
+		if want != got || sample.Timestamp != found[0].Timestamp {
+			t.Errorf(
+				"Value (or timestamp) mismatch, want %f (at time %v), got %f (at time %v).",
+				want, sample.Timestamp, got, found[0].Timestamp,
+			)
 			result = false
 		}
+		p.Close()
 	}
 	return result
 }

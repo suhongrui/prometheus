@@ -464,7 +464,7 @@ func (s *memorySeriesStorage) loop() {
 					// Keep going.
 				}
 				s.fpLocker.Lock(m.fp)
-				allEvicted, persistHeadChunk := m.series.evictOlderThan(
+				allEvicted, headChunkToPersist := m.series.evictOlderThan(
 					clientmodel.TimestampFromTime(time.Now()).Add(-1 * s.evictAfter),
 				)
 				if allEvicted {
@@ -480,8 +480,8 @@ func (s *memorySeriesStorage) loop() {
 				}
 				s.fpLocker.Unlock(m.fp)
 				// Queue outside of lock!
-				if persistHeadChunk {
-					s.persistQueue <- persistRequest{m.fp, m.series.head()}
+				if headChunkToPersist != nil {
+					s.persistQueue <- persistRequest{m.fp, headChunkToPersist}
 				}
 			}
 
