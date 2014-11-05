@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,10 +104,14 @@ type persistence struct {
 	indexingBatchSizes    prometheus.Summary
 	indexingBatchLatency  prometheus.Summary
 	checkpointDuration    prometheus.Gauge
+
+	dirtyMtx sync.Mutex // Protects dirty and becameDirty.
+
+	dirty, becameDirty bool
 }
 
 // newPersistence returns a newly allocated persistence backed by local disk storage, ready to use.
-func newPersistence(basePath string, chunkLen int) (*persistence, error) {
+func newPersistence(basePath string, chunkLen int, dirty bool) (*persistence, error) {
 	if err := os.MkdirAll(basePath, 0700); err != nil {
 		return nil, err
 	}
@@ -178,7 +183,18 @@ func newPersistence(basePath string, chunkLen int) (*persistence, error) {
 			Name:      "checkpoint_duration_milliseconds",
 			Help:      "The duration (in milliseconds) it took to checkpoint in-memory metrics and head chunks.",
 		}),
+
+		dirty: dirty,
 	}
+
+	if dirtyFile, err := os.OpenFile(p.dirtyFileName(), os.O_CREATE|os.O_EXCL, 0666); err == nil {
+		dirtyFile.Close()
+	} else if os.IsExist(err) {
+		p.dirty = true
+	} else {
+		return nil, err
+	}
+
 	go p.processIndexingQueue()
 	return p, nil
 }
@@ -201,6 +217,182 @@ func (p *persistence) Collect(ch chan<- prometheus.Metric) {
 	p.indexingBatchSizes.Collect(ch)
 	p.indexingBatchLatency.Collect(ch)
 	ch <- p.checkpointDuration
+}
+
+// dirtyFileName returns the name of the (empty) file used to mark the
+// persistency layer as dirty.
+func (p *persistence) dirtyFileName() string {
+	return path.Join(p.basePath, "DIRTY")
+}
+
+// isDirty returns the dirty flag in a goroutine-safe way.
+func (p *persistence) isDirty() bool {
+	p.dirtyMtx.Lock()
+	defer p.dirtyMtx.Unlock()
+	return p.dirty
+}
+
+// setDirty sets the dirty flag in a goroutine-safe way. Once the dirty flag was
+// set to true with this method, it cannot be set to false again. (If we became
+// dirty during our runtime, there is no way back. If we were dirty from the
+// start, a clean-up might make us clean again.)
+func (p *persistence) setDirty(dirty bool) {
+	p.dirtyMtx.Lock()
+	defer p.dirtyMtx.Unlock()
+	if p.becameDirty {
+		return
+	}
+	p.dirty = dirty
+	if dirty {
+		p.becameDirty = true
+	}
+}
+
+// cleanUpStage1 is called by loadSeriesMapAndHeads if the persistence appears
+// to be dirty after the loading (either because the loading resulted in an
+// error or because the persistence was dirty from the start).
+func (p *persistence) cleanUpStage1(fingerprintToSeries map[clientmodel.Fingerprint]*memorySeries) error {
+	glog.Warning("Starting clean-up stage 1. Prometheus is inoperational until stage 1 is complete.")
+
+	fpsSeen := map[clientmodel.Fingerprint]struct{}{}
+
+	for i := 0; i < 256; i++ {
+		dirname := path.Join(p.basePath, fmt.Sprintf("%02x", i))
+		dir, err := os.Open(dirname)
+		if err == os.ErrNotExist {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		defer dir.Close()
+		var fis []os.FileInfo
+		for ; err != io.EOF; fis, err = dir.Readdir(1024) {
+			if err != nil {
+				return err
+			}
+			for _, fi := range fis {
+				fp, ok := p.sanitizeSeries(dirname, fi, fingerprintToSeries)
+				if ok {
+					fpsSeen[fp] = struct{}{}
+				}
+			}
+		}
+	}
+
+	for fp, s := range fingerprintToSeries {
+		if _, seen := fpsSeen[fp]; !seen {
+			// fp exists in fingerprintToSeries, but has no representation on disk.
+			if s.headChunkPersisted {
+				// Oops, head chunk was persisted, but nothing on disk.
+				// Thus, we lost that series completely. Clean up the remnants.
+				delete(fingerprintToSeries, fp)
+				if err := p.dropArchivedMetric(fp); err != nil {
+					// Dropping the archived metric didn't work, so try
+					// to unindex it, just in case it's in the indexes.
+					p.unindexMetric(fp, s.metric)
+				}
+				glog.Warningf("Lost series detected: fingerprint %v, metric %v.", fp, s.metric)
+				continue
+			}
+			// If we are here, the only chunk we have is the head chunk.
+			// Adjust things accordingly.
+			if len(s.chunkDescs) > 1 || s.chunkDescsOffset != 0 {
+				glog.Warningf(
+					"Lost at least %d chunks for fingerprint %v, metric %v.",
+					len(s.chunkDescs)+s.chunkDescsOffset-1, fp, s.metric,
+					// If chunkDescsOffset is -1, this will underreport. Oh well...
+				)
+				s.chunkDescs = s.chunkDescs[len(s.chunkDescs)-1:]
+				s.chunkDescsOffset = 0
+			}
+		}
+	}
+
+	glog.Warning("Clean-up stage 1 completed.")
+	return nil
+}
+
+// TODO: Document.
+func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprintToSeries map[clientmodel.Fingerprint]*memorySeries) (clientmodel.Fingerprint, bool) {
+	filename := path.Join(dirname, fi.Name())
+	purge := func() {
+		glog.Warningf("Deleting lost series file %s.", filename) // TODO: Move to lost+found directory?
+		os.Remove(filename)
+	}
+
+	var fp clientmodel.Fingerprint
+	if len(fi.Name()) != 17 || !strings.HasSuffix(fi.Name(), ".db") {
+		glog.Warningf("Unexpected series file name %s.", filename)
+		purge()
+		return fp, false
+	}
+	fp.LoadFromString(path.Base(dirname) + fi.Name()) // TODO: Panics if fi.Name() doesn't parse as hex.
+
+	bytesToTrim := fi.Size() % int64(p.chunkLen+chunkHeaderLen)
+	chunksInFile := int(fi.Size())/p.chunkLen + chunkHeaderLen
+	if bytesToTrim != 0 {
+		glog.Warningf(
+			"Truncating file %s to exactly %d chunks, trimming %d extraneous bytes.",
+			filename, chunksInFile, bytesToTrim,
+		)
+		f, err := os.OpenFile(filename, os.O_WRONLY, 0640)
+		if err != nil {
+			glog.Errorf("Could not open file %s: %s", filename, err)
+			return fp, true
+		}
+		if err := f.Truncate(fi.Size() - bytesToTrim); err != nil {
+			glog.Errorf("Failed to truncate file %s: %s", filename, err)
+			return fp, true
+		}
+	}
+
+	s, ok := fingerprintToSeries[fp]
+	if ok {
+		// This series is supposed to not be archived.
+		if s == nil {
+			panic("fingerprint mapped to nil pointer")
+		}
+		if bytesToTrim == 0 && s.chunkDescsOffset != -1 &&
+			(s.headChunkPersisted && chunksInFile == s.chunkDescsOffset+len(s.chunkDescs)) ||
+			(!s.headChunkPersisted && chunksInFile == s.chunkDescsOffset+len(s.chunkDescs)-1) {
+			// Everything is consistent. We are good.
+			return fp, true
+		}
+		// TODO deal with remaining cases.
+	} else {
+		// This series is supposed to be archived.
+		metric, err := p.getArchivedMetric(fp)
+		if err != nil {
+			glog.Errorf(
+				"Fingerprint %v assumed archived but couldn't be looked up in archived index: %s",
+				fp, err,
+			)
+			purge()
+			return fp, true
+		}
+		if metric == nil {
+			glog.Warningf(
+				"Fingerprint %v assumed archived but couldn't be found in archived index.",
+				fp,
+			)
+			purge()
+			return fp, true
+		}
+		// This series looks like a properly archived one.
+	}
+	return fp, true
+}
+
+// cleanUpStage2 completes the clean-up of a dirty persistence. It is run as
+// a goroutine in parallel to normal operations (but queries might yield
+// incomplete results). If it is successful, it will unset the dirty flag of
+// the persistence.
+func (p *persistence) cleanUpStage2(fingerprintToSeries *seriesMap) {
+	glog.Warning("Starting clean-up stage 2. Prometheus is able to serve now, but queries may yield incomplete results.")
+	// TODO: Implement.
+	p.setDirty(false)
+	glog.Warning("Clean-up stage 2 completed. Prometheus is fully operational.")
 }
 
 // getFingerprintsForLabelPair returns the fingerprints for the given label
@@ -492,63 +684,100 @@ func (p *persistence) checkpointSeriesMapAndHeads(fingerprintToSeries *seriesMap
 }
 
 // loadSeriesMapAndHeads loads the fingerprint to memory-series mapping and all
-// open (non-full) head chunks. Only call this method during start-up while
-// nothing else is running in storage land. This method is utterly
-// goroutine-unsafe.
-func (p *persistence) loadSeriesMapAndHeads() (*seriesMap, error) {
+// open (non-full) head chunks. If recoverable corruption is detected, or if the
+// dirty flag was set from the beginning, stage 1 of the clean-up is run. The
+// method will return once it is done. An unrecoverable error is returned. Call
+// this method during start-up while nothing else is running in storage
+// land. This method is utterly goroutine-unsafe.
+func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, err error) {
 	var chunksTotal, chunkDescsTotal int64
+	fingerprintToSeries := make(map[clientmodel.Fingerprint]*memorySeries)
+	sm = &seriesMap{m: fingerprintToSeries}
+
+	defer func() {
+		if sm != nil && p.dirty {
+			glog.Warning("Persistence layer appears dirty.")
+			if err = p.cleanUpStage1(fingerprintToSeries); err != nil {
+				sm = nil
+			}
+			go p.cleanUpStage2(sm)
+		}
+		if err == nil {
+			atomic.AddInt64(&numMemChunks, chunksTotal)
+			atomic.AddInt64(&numMemChunkDescs, chunkDescsTotal)
+		}
+	}()
 
 	f, err := os.Open(p.headsFileName())
 	if os.IsNotExist(err) {
-		return newSeriesMap(), nil
+		return
 	}
 	if err != nil {
-		return nil, err
+		glog.Warning("Could not open heads file:", err)
+		p.dirty = true
+		return
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, fileBufSize)
 
 	buf := make([]byte, len(headsMagicString))
 	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, err
+		glog.Warning("Could not read from heads file:", err)
+		p.dirty = true
+		return sm, nil
 	}
 	magic := string(buf)
 	if magic != headsMagicString {
-		return nil, fmt.Errorf(
+		glog.Warningf(
 			"unexpected magic string, want %q, got %q",
 			headsMagicString, magic,
 		)
+		p.dirty = true
+		return
 	}
 	if version, err := binary.ReadVarint(r); version != headsFormatVersion || err != nil {
-		return nil, fmt.Errorf("unknown heads format version, want %d", headsFormatVersion)
+		glog.Warningf("unknown heads format version, want %d", headsFormatVersion)
+		p.dirty = true
+		return sm, nil
 	}
 	numSeries, err := codable.DecodeUint64(r)
 	if err != nil {
-		return nil, err
+		glog.Warning("Could not decode number of series:", err)
+		p.dirty = true
+		return sm, nil
 	}
-	fingerprintToSeries := make(map[clientmodel.Fingerprint]*memorySeries, numSeries)
 
 	for ; numSeries > 0; numSeries-- {
 		seriesFlags, err := r.ReadByte()
 		if err != nil {
-			return nil, err
+			glog.Warning("Could not read series flags:", err)
+			p.dirty = true
+			return sm, nil
 		}
 		headChunkPersisted := seriesFlags&flagHeadChunkPersisted != 0
 		fp, err := codable.DecodeUint64(r)
 		if err != nil {
-			return nil, err
+			glog.Warning("Could not decode fingerprint:", err)
+			p.dirty = true
+			return sm, nil
 		}
 		var metric codable.Metric
 		if err := metric.UnmarshalFromReader(r); err != nil {
-			return nil, err
+			glog.Warning("Could not decode metric:", err)
+			p.dirty = true
+			return sm, nil
 		}
 		chunkDescsOffset, err := binary.ReadVarint(r)
 		if err != nil {
-			return nil, err
+			glog.Warning("Could not decode chunk descriptor offset:", err)
+			p.dirty = true
+			return sm, nil
 		}
 		numChunkDescs, err := binary.ReadVarint(r)
 		if err != nil {
-			return nil, err
+			glog.Warning("Could not decode number of chunk descriptors:", err)
+			p.dirty = true
+			return sm, nil
 		}
 		chunkDescs := make([]*chunkDesc, numChunkDescs)
 		chunkDescsTotal += numChunkDescs
@@ -557,11 +786,15 @@ func (p *persistence) loadSeriesMapAndHeads() (*seriesMap, error) {
 			if headChunkPersisted || i < numChunkDescs-1 {
 				firstTime, err := binary.ReadVarint(r)
 				if err != nil {
-					return nil, err
+					glog.Warning("Could not decode first time:", err)
+					p.dirty = true
+					return sm, nil
 				}
 				lastTime, err := binary.ReadVarint(r)
 				if err != nil {
-					return nil, err
+					glog.Warning("Could not decode last time:", err)
+					p.dirty = true
+					return sm, nil
 				}
 				chunkDescs[i] = &chunkDesc{
 					chunkFirstTime: clientmodel.Timestamp(firstTime),
@@ -572,11 +805,15 @@ func (p *persistence) loadSeriesMapAndHeads() (*seriesMap, error) {
 				chunksTotal++
 				chunkType, err := r.ReadByte()
 				if err != nil {
-					return nil, err
+					glog.Warning("Could not decode chunk type:", err)
+					p.dirty = true
+					return sm, nil
 				}
 				chunk := chunkForType(chunkType)
 				if err := chunk.unmarshal(r); err != nil {
-					return nil, err
+					glog.Warning("Could not decode chunk type:", err)
+					p.dirty = true
+					return sm, nil
 				}
 				chunkDescs[i] = newChunkDesc(chunk)
 			}
@@ -589,9 +826,7 @@ func (p *persistence) loadSeriesMapAndHeads() (*seriesMap, error) {
 			headChunkPersisted: headChunkPersisted,
 		}
 	}
-	atomic.AddInt64(&numMemChunks, chunksTotal)
-	atomic.AddInt64(&numMemChunkDescs, chunkDescsTotal)
-	return &seriesMap{m: fingerprintToSeries}, nil
+	return sm, nil
 }
 
 // dropChunks deletes all chunks from a series whose last sample time is before
@@ -798,7 +1033,8 @@ func (p *persistence) unarchiveMetric(fp clientmodel.Fingerprint) (bool, error) 
 }
 
 // close flushes the indexing queue and other buffered data and releases any
-// held resources.
+// held resources. It also removes the dirty marker file if successful and if
+// the persistence is currently not marked as dirty.
 func (p *persistence) close() error {
 	close(p.indexingQueue)
 	<-p.indexingStopped
@@ -820,22 +1056,25 @@ func (p *persistence) close() error {
 		lastError = err
 		glog.Error("Error closing labelNameToLabelValues index DB: ", err)
 	}
+	if lastError == nil && !p.dirty {
+		lastError = os.Remove(p.dirtyFileName())
+	}
 	return lastError
 }
 
 func (p *persistence) dirNameForFingerprint(fp clientmodel.Fingerprint) string {
 	fpStr := fp.String()
-	return fmt.Sprintf("%s/%c%c", p.basePath, fpStr[0], fpStr[1])
+	return path.Join(p.basePath, fpStr[0:2])
 }
 
 func (p *persistence) fileNameForFingerprint(fp clientmodel.Fingerprint) string {
 	fpStr := fp.String()
-	return fmt.Sprintf("%s/%c%c/%s%s", p.basePath, fpStr[0], fpStr[1], fpStr[2:], seriesFileSuffix)
+	return path.Join(p.basePath, fpStr[0:2], fpStr[2:]+seriesFileSuffix)
 }
 
 func (p *persistence) tempFileNameForFingerprint(fp clientmodel.Fingerprint) string {
 	fpStr := fp.String()
-	return fmt.Sprintf("%s/%c%c/%s%s", p.basePath, fpStr[0], fpStr[1], fpStr[2:], seriesTempFileSuffix)
+	return path.Join(p.basePath, fpStr[0:2], fpStr[2:]+seriesTempFileSuffix)
 }
 
 func (p *persistence) openChunkFileForWriting(fp clientmodel.Fingerprint) (*os.File, error) {

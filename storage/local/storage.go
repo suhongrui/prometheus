@@ -27,7 +27,10 @@ import (
 	"github.com/prometheus/prometheus/storage/metric"
 )
 
-const persistQueueCap = 1024
+const (
+	persistQueueCap = 1024
+	chunkLen        = 1024
+)
 
 type storageState uint
 
@@ -74,12 +77,13 @@ type MemorySeriesStorageOptions struct {
 	PersistencePurgeInterval   time.Duration // How often to check for purging.
 	PersistenceRetentionPeriod time.Duration // Chunks at least that old are purged.
 	CheckpointInterval         time.Duration // How often to checkpoint the series map and head chunks.
+	Dirty                      bool          // Force the storage to consider itself dirty on startup.
 }
 
 // NewMemorySeriesStorage returns a newly allocated Storage. Storage.Serve still
 // has to be called to start the storage.
 func NewMemorySeriesStorage(o *MemorySeriesStorageOptions) (Storage, error) {
-	p, err := newPersistence(o.PersistenceStoragePath, 1024)
+	p, err := newPersistence(o.PersistenceStoragePath, chunkLen, o.Dirty)
 	if err != nil {
 		return nil, err
 	}
@@ -420,9 +424,9 @@ func (s *memorySeriesStorage) handlePersistQueue() {
 		s.persistLatency.Observe(float64(time.Since(start)) / float64(time.Microsecond))
 		if err != nil {
 			s.persistErrors.WithLabelValues(err.Error()).Inc()
+			s.persistence.setDirty(true)
 			glog.Error("Error persisting chunk: ", err)
-			glog.Error("The storage is now inconsistent. Prepare for disaster.")
-			// TODO: Remove respective chunkDesc to at least be consistent?
+			glog.Error("The storage is now inconsistent. Restart Prometheus ASAP to initiate recovery.")
 			continue
 		}
 		req.chunkDesc.unpin()

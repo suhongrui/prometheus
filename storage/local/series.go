@@ -144,7 +144,7 @@ type memorySeries struct {
 	// special case: There are chunks on disk, but the offset to the
 	// chunkDescs in memory is unknown. Also, there is no overlap between
 	// chunks on disk and chunks in memory (implying that upon first
-	// persiting of a chunk in memory, the offset has to be set).
+	// persisting of a chunk in memory, the offset has to be set).
 	chunkDescsOffset int
 	// Whether the current head chunk has already been scheduled to be
 	// persisted. If true, the current head chunk must not be modified
