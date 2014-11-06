@@ -330,7 +330,7 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 		purge()
 		return fp, false
 	}
-	fp.LoadFromString(path.Base(dirname) + fi.Name()) // TODO: Panics if fi.Name() doesn't parse as hex.
+	fp.LoadFromString(path.Base(dirname) + fi.Name()[:14]) // TODO: Panics if that doesn't parse as hex.
 
 	bytesToTrim := fi.Size() % int64(p.chunkLen+chunkHeaderLen)
 	chunksInFile := int(fi.Size())/p.chunkLen + chunkHeaderLen
