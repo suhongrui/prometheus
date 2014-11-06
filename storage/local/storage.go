@@ -350,9 +350,10 @@ func (s *memorySeriesStorage) appendSample(sample *clientmodel.Sample) {
 func (s *memorySeriesStorage) getOrCreateSeries(fp clientmodel.Fingerprint, m clientmodel.Metric) *memorySeries {
 	series, ok := s.fpToSeries.get(fp)
 	if !ok {
-		unarchived, err := s.persistence.unarchiveMetric(fp)
+		unarchived, firstTime, err := s.persistence.unarchiveMetric(fp)
 		if err != nil {
 			glog.Errorf("Error unarchiving fingerprint %v: %v", fp, err)
+			s.persistence.setDirty(true)
 		}
 		if unarchived {
 			s.seriesOps.WithLabelValues(unarchive).Inc()
@@ -361,7 +362,7 @@ func (s *memorySeriesStorage) getOrCreateSeries(fp clientmodel.Fingerprint, m cl
 			s.persistence.indexMetric(fp, m)
 			s.seriesOps.WithLabelValues(create).Inc()
 		}
-		series = newMemorySeries(m, !unarchived)
+		series = newMemorySeries(m, !unarchived, firstTime)
 		s.fpToSeries.put(fp, series)
 		s.numSeries.Inc()
 	}
@@ -424,9 +425,8 @@ func (s *memorySeriesStorage) handlePersistQueue() {
 		s.persistLatency.Observe(float64(time.Since(start)) / float64(time.Microsecond))
 		if err != nil {
 			s.persistErrors.WithLabelValues(err.Error()).Inc()
-			s.persistence.setDirty(true)
 			glog.Error("Error persisting chunk: ", err)
-			glog.Error("The storage is now inconsistent. Restart Prometheus ASAP to initiate recovery.")
+			s.persistence.setDirty(true)
 			continue
 		}
 		req.chunkDesc.unpin()
@@ -478,6 +478,7 @@ func (s *memorySeriesStorage) loop() {
 						m.fp, m.series.metric, m.series.firstTime(), m.series.lastTime(),
 					); err != nil {
 						glog.Errorf("Error archiving metric %v: %v", m.series.metric, err)
+						s.persistence.setDirty(true)
 					} else {
 						s.seriesOps.WithLabelValues(archive).Inc()
 					}
@@ -539,6 +540,7 @@ func (s *memorySeriesStorage) purgeSeries(fp clientmodel.Fingerprint, beforeTime
 	numDropped, allDropped, err := s.persistence.dropChunks(fp, beforeTime)
 	if err != nil {
 		glog.Error("Error purging persisted chunks: ", err)
+		s.persistence.setDirty(true)
 	}
 
 	// Purge chunks from memory accordingly.
@@ -567,6 +569,7 @@ func (s *memorySeriesStorage) purgeSeries(fp clientmodel.Fingerprint, beforeTime
 	if allDropped {
 		if err := s.persistence.dropArchivedMetric(fp); err != nil {
 			glog.Errorf("Error dropping archived metric for fingerprint %v: %v", fp, err)
+			s.persistence.setDirty(true)
 		} else {
 			s.seriesOps.WithLabelValues(archivePurge).Inc()
 		}

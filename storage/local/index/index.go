@@ -259,13 +259,6 @@ func (i *FingerprintTimeRangeIndex) Lookup(fp clientmodel.Fingerprint) (firstTim
 	return tr.First, tr.Last, ok, err
 }
 
-// Has returns true if the given fingerprint is present.
-//
-// This method is goroutine-safe.
-func (i *FingerprintTimeRangeIndex) Has(fp clientmodel.Fingerprint) (ok bool, err error) {
-	return i.KeyValueStore.Has(codable.Fingerprint(fp))
-}
-
 // NewFingerprintTimeRangeIndex returns a LevelDB-backed
 // FingerprintTimeRangeIndex ready to use.
 func NewFingerprintTimeRangeIndex(basePath string) (*FingerprintTimeRangeIndex, error) {

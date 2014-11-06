@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"strings"
@@ -245,13 +246,15 @@ func (p *persistence) setDirty(dirty bool) {
 	p.dirty = dirty
 	if dirty {
 		p.becameDirty = true
+		glog.Error("The storage is now inconsistent. Restart Prometheus ASAP to initiate recovery.")
 	}
 }
 
 // cleanUpStage1 is called by loadSeriesMapAndHeads if the persistence appears
 // to be dirty after the loading (either because the loading resulted in an
-// error or because the persistence was dirty from the start).
-func (p *persistence) cleanUpStage1(fingerprintToSeries map[clientmodel.Fingerprint]*memorySeries) error {
+// error or because the persistence was dirty from the start). It returns the
+// fingerprints seen on disk.
+func (p *persistence) cleanUpStage1(fingerprintToSeries map[clientmodel.Fingerprint]*memorySeries) (map[clientmodel.Fingerprint]struct{}, error) {
 	glog.Warning("Starting clean-up stage 1. Prometheus is inoperational until stage 1 is complete.")
 
 	fpsSeen := map[clientmodel.Fingerprint]struct{}{}
@@ -259,17 +262,17 @@ func (p *persistence) cleanUpStage1(fingerprintToSeries map[clientmodel.Fingerpr
 	for i := 0; i < 256; i++ {
 		dirname := path.Join(p.basePath, fmt.Sprintf("%02x", i))
 		dir, err := os.Open(dirname)
-		if err == os.ErrNotExist {
+		if os.IsNotExist(err) {
 			continue
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer dir.Close()
 		var fis []os.FileInfo
 		for ; err != io.EOF; fis, err = dir.Readdir(1024) {
 			if err != nil {
-				return err
+				return nil, err
 			}
 			for _, fi := range fis {
 				fp, ok := p.sanitizeSeries(dirname, fi, fingerprintToSeries)
@@ -310,7 +313,7 @@ func (p *persistence) cleanUpStage1(fingerprintToSeries map[clientmodel.Fingerpr
 	}
 
 	glog.Warning("Clean-up stage 1 completed.")
-	return nil
+	return fpsSeen, nil
 }
 
 // TODO: Document.
@@ -339,12 +342,19 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 		f, err := os.OpenFile(filename, os.O_WRONLY, 0640)
 		if err != nil {
 			glog.Errorf("Could not open file %s: %s", filename, err)
-			return fp, true
+			purge()
+			return fp, false
 		}
 		if err := f.Truncate(fi.Size() - bytesToTrim); err != nil {
 			glog.Errorf("Failed to truncate file %s: %s", filename, err)
-			return fp, true
+			purge()
+			return fp, false
 		}
+	}
+	if chunksInFile == 0 {
+		glog.Warningf("No chunks left in file %s.", filename)
+		purge()
+		return fp, false
 	}
 
 	s, ok := fingerprintToSeries[fp]
@@ -359,7 +369,55 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 			// Everything is consistent. We are good.
 			return fp, true
 		}
-		// TODO deal with remaining cases.
+		// If we are here, something's fishy.
+		if s.headChunkPersisted {
+			// This is the easy case as we don't have a head chunk
+			// in heads.db. Treat this series as a freshly
+			// unarchived one. No chunks or chunkDescs in memory, no
+			// current head chunk.
+			glog.Warningf(
+				"Treating recovered metric %v, fingerprint %v, as freshly unarchvied, with %d recovered chunks on disk. Some samples may have been lost.",
+				s.metric, fp, chunksInFile,
+			)
+			s.chunkDescs = nil
+			s.chunkDescsOffset = -1
+			return fp, true
+		}
+		// This is the tricky one: We have a head chunk from heads.db,
+		// but the very same head chunk might already be in the series
+		// file. Strategy: Check the first time of both. If it is the
+		// same or newer, assume the latest chunk in the series file
+		// is the most recent head chunk. If not, keep the head chunk
+		// we got from heads.db.
+		// First, assume the head chunk is not yet persisted.
+		s.chunkDescs = s.chunkDescs[len(s.chunkDescs)-1:]
+		s.chunkDescsOffset = -1
+		// Load all the chunk descs (which assumes we have none from the future).
+		cds, err := p.loadChunkDescs(fp, clientmodel.Now())
+		if err != nil {
+			glog.Errorf(
+				"Failed to load chunk descriptors for metric %v, fingerprint %v: %s",
+				s.metric, fp, err,
+			)
+			purge()
+			return fp, false
+		}
+		if cds[len(cds)-1].firstTime().Before(s.head().firstTime()) {
+			s.chunkDescs = append(cds, s.chunkDescs...)
+			glog.Warningf(
+				"Recovered metric %v, fingerprint %v, including head chunk, with %d recovered chunks on disk. Some samples may have been lost.",
+				s.metric, fp, chunksInFile,
+			)
+		} else {
+			glog.Warningf(
+				"Recovered metric %v, fingerprint %v, with head chunk found among the %d recovered chunks in series file. Some samples may have been lost.",
+				s.metric, fp, chunksInFile,
+			)
+			s.chunkDescs = cds
+			s.headChunkPersisted = true
+		}
+		s.chunkDescsOffset = 0
+		return fp, true
 	} else {
 		// This series is supposed to be archived.
 		metric, err := p.getArchivedMetric(fp)
@@ -369,7 +427,7 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 				fp, err,
 			)
 			purge()
-			return fp, true
+			return fp, false
 		}
 		if metric == nil {
 			glog.Warningf(
@@ -377,7 +435,7 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 				fp,
 			)
 			purge()
-			return fp, true
+			return fp, false
 		}
 		// This series looks like a properly archived one.
 	}
@@ -388,11 +446,105 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 // a goroutine in parallel to normal operations (but queries might yield
 // incomplete results). If it is successful, it will unset the dirty flag of
 // the persistence.
-func (p *persistence) cleanUpStage2(fingerprintToSeries *seriesMap) {
+func (p *persistence) cleanUpStage2(fingerprintToSeries *seriesMap, fpsSeen map[clientmodel.Fingerprint]struct{}) {
 	glog.Warning("Starting clean-up stage 2. Prometheus is able to serve now, but queries may yield incomplete results.")
-	// TODO: Implement.
+	if err := p.cleanUpArchiveIndexes(fingerprintToSeries, fpsSeen); err != nil {
+		glog.Error("Error during clean-up of archive indexes, storage remains dirty: ", err)
+		return
+	}
+	if err := p.cleanUpLabelIndexes(fingerprintToSeries); err != nil {
+		glog.Error("Error during clean-up of label indexes, storage remains dirty: ", err)
+		return
+	}
 	p.setDirty(false)
 	glog.Warning("Clean-up stage 2 completed. Prometheus is fully operational.")
+}
+
+func (p *persistence) cleanUpArchiveIndexes(fpToSeries *seriesMap, fpsSeen map[clientmodel.Fingerprint]struct{}) error {
+	p.archiveMtx.Lock()
+	defer p.archiveMtx.Unlock()
+
+	glog.Warning("Cleaning up archive indexes. Archiving is blocked while clean-up is in progress.")
+	var fp codable.Fingerprint
+	var m codable.Metric
+	if err := p.archivedFingerprintToMetrics.ForEach(func(kv index.KeyValueAccessor) error {
+		if err := kv.Key(&fp); err != nil {
+			return err
+		}
+		_, notArchived := fpToSeries.get(clientmodel.Fingerprint(fp))
+		_, onDisk := fpsSeen[clientmodel.Fingerprint(fp)]
+		if notArchived || !onDisk {
+			if notArchived {
+				glog.Warningf("Archive clean-up: Fingerprint %v is not archived. Purging from archive indexes.", fp)
+			}
+			if !onDisk {
+				glog.Warningf("Archive clean-up: Fingerprint %v is not on disk. Purging from archive indexes.", fp)
+			}
+			if err := p.archivedFingerprintToMetrics.Delete(fp); err != nil {
+				return err
+			}
+			// Delete from timerange index, too.
+			p.archivedFingerprintToTimeRange.Delete(fp)
+			// TODO: Ignoring errors here as fp might not be in
+			// timerange index (which is good) but which would
+			// return an error. Delete signature could be changed
+			// like the Get signature.
+			return nil
+		}
+		// fp is legitimately archived. Make sure it is in timerange index, too.
+		has, err := p.archivedFingerprintToTimeRange.Has(fp)
+		if err != nil {
+			return err
+		}
+		if has {
+			return nil // All good.
+		}
+		glog.Warningf("Archive clean-up: Fingerprint %v is not in time-range index. Unarchiving it for recovery.")
+		if err := p.archivedFingerprintToMetrics.Delete(fp); err != nil {
+			return err
+		}
+		if err := kv.Value(&m); err != nil {
+			return err
+		}
+		series := newMemorySeries(clientmodel.Metric(m), false, math.MinInt64)
+		cds, err := p.loadChunkDescs(clientmodel.Fingerprint(fp), clientmodel.Now())
+		if err != nil {
+			return err
+		}
+		series.chunkDescs = cds
+		series.chunkDescsOffset = 0
+		fpToSeries.put(clientmodel.Fingerprint(fp), series)
+		// TODO: memorySeriesStorage.numSeries is not incremented.
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := p.archivedFingerprintToTimeRange.ForEach(func(kv index.KeyValueAccessor) error {
+		if err := kv.Key(&fp); err != nil {
+			return err
+		}
+		has, err := p.archivedFingerprintToMetrics.Has(fp)
+		if err != nil {
+			return err
+		}
+		if has {
+			return nil // All good.
+		}
+		glog.Warningf("Archive clean-up: Purging unknown fingerprint %v in time-range index.", fp)
+		if err := p.archivedFingerprintToTimeRange.Delete(fp); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	glog.Warning("Clean-up of archive indexes complete.")
+	return nil
+}
+
+func (p *persistence) cleanUpLabelIndexes(fpToSeries *seriesMap) error {
+	// TODO implement
+	return nil
 }
 
 // getFingerprintsForLabelPair returns the fingerprints for the given label
@@ -697,10 +849,11 @@ func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, err error) {
 	defer func() {
 		if sm != nil && p.dirty {
 			glog.Warning("Persistence layer appears dirty.")
-			if err = p.cleanUpStage1(fingerprintToSeries); err != nil {
+			fpsSeen, err := p.cleanUpStage1(fingerprintToSeries)
+			if err != nil {
 				sm = nil
 			}
-			go p.cleanUpStage2(sm)
+			go p.cleanUpStage2(sm, fpsSeen)
 		}
 		if err == nil {
 			atomic.AddInt64(&numMemChunks, chunksTotal)
@@ -710,7 +863,7 @@ func (p *persistence) loadSeriesMapAndHeads() (sm *seriesMap, err error) {
 
 	f, err := os.Open(p.headsFileName())
 	if os.IsNotExist(err) {
-		return
+		return sm, nil
 	}
 	if err != nil {
 		glog.Warning("Could not open heads file:", err)
@@ -1013,23 +1166,24 @@ func (p *persistence) dropArchivedMetric(fp clientmodel.Fingerprint) error {
 }
 
 // unarchiveMetric deletes an archived fingerprint and its metric, but (in
-// contrast to dropArchivedMetric) does not un-index the metric.  The method
-// returns true if a metric was actually deleted. This method is goroutine-safe.
-func (p *persistence) unarchiveMetric(fp clientmodel.Fingerprint) (bool, error) {
+// contrast to dropArchivedMetric) does not un-index the metric.  If a metric
+// was actually deleted, the method returns true and the first time of the
+// deleted metric. This method is goroutine-safe.
+func (p *persistence) unarchiveMetric(fp clientmodel.Fingerprint) (bool, clientmodel.Timestamp, error) {
 	p.archiveMtx.Lock()
 	defer p.archiveMtx.Unlock()
 
-	has, err := p.archivedFingerprintToTimeRange.Has(fp)
+	firstTime, _, has, err := p.archivedFingerprintToTimeRange.Lookup(fp)
 	if err != nil || !has {
-		return false, err
+		return false, firstTime, err
 	}
 	if err := p.archivedFingerprintToMetrics.Delete(codable.Fingerprint(fp)); err != nil {
-		return false, err
+		return false, firstTime, err
 	}
 	if err := p.archivedFingerprintToTimeRange.Delete(codable.Fingerprint(fp)); err != nil {
-		return false, err
+		return false, firstTime, err
 	}
-	return true, nil
+	return true, firstTime, nil
 }
 
 // close flushes the indexing queue and other buffered data and releases any
