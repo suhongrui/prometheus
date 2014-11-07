@@ -15,7 +15,6 @@
 package local
 
 import (
-	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -64,6 +63,7 @@ type memorySeriesStorage struct {
 	numSeries                    prometheus.Gauge
 	seriesOps                    *prometheus.CounterVec
 	ingestedSamplesCount         prometheus.Counter
+	invalidPreloadRequestsCount  prometheus.Counter
 	purgeDuration, evictDuration prometheus.Gauge
 }
 
@@ -153,6 +153,12 @@ func NewMemorySeriesStorage(o *MemorySeriesStorageOptions) (Storage, error) {
 			Subsystem: subsystem,
 			Name:      "ingested_samples_total",
 			Help:      "The total number of samples ingested.",
+		}),
+		invalidPreloadRequestsCount: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "invalid_preload_requests_total",
+			Help:      "The total number of preload requests referring to a non-existent series. This is an indication of outdated label indexes.",
 		}),
 		purgeDuration: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -394,7 +400,8 @@ func (s *memorySeriesStorage) preloadChunksForRange(
 			return nil, err
 		}
 		if !has {
-			return nil, fmt.Errorf("requested preload for non-existent series %v", fp)
+			s.invalidPreloadRequestsCount.Inc()
+			return nil, nil
 		}
 		if from.Add(-stalenessDelta).Before(last) && through.Add(stalenessDelta).After(first) {
 			metric, err := s.persistence.getArchivedMetric(fp)
