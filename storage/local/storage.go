@@ -605,6 +605,7 @@ func (s *memorySeriesStorage) Describe(ch chan<- *prometheus.Desc) {
 	ch <- s.numSeries.Desc()
 	s.seriesOps.Describe(ch)
 	ch <- s.ingestedSamplesCount.Desc()
+	ch <- s.invalidPreloadRequestsCount.Desc()
 	ch <- s.purgeDuration.Desc()
 	ch <- s.evictDuration.Desc()
 
@@ -624,6 +625,7 @@ func (s *memorySeriesStorage) Collect(ch chan<- prometheus.Metric) {
 	ch <- s.numSeries
 	s.seriesOps.Collect(ch)
 	ch <- s.ingestedSamplesCount
+	ch <- s.invalidPreloadRequestsCount
 	ch <- s.purgeDuration
 	ch <- s.evictDuration
 

@@ -333,7 +333,7 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 	fp.LoadFromString(path.Base(dirname) + fi.Name()[:14]) // TODO: Panics if that doesn't parse as hex.
 
 	bytesToTrim := fi.Size() % int64(p.chunkLen+chunkHeaderLen)
-	chunksInFile := int(fi.Size())/p.chunkLen + chunkHeaderLen
+	chunksInFile := int(fi.Size()) / (p.chunkLen + chunkHeaderLen)
 	if bytesToTrim != 0 {
 		glog.Warningf(
 			"Truncating file %s to exactly %d chunks, trimming %d extraneous bytes.",
@@ -364,8 +364,8 @@ func (p *persistence) sanitizeSeries(dirname string, fi os.FileInfo, fingerprint
 			panic("fingerprint mapped to nil pointer")
 		}
 		if bytesToTrim == 0 && s.chunkDescsOffset != -1 &&
-			(s.headChunkPersisted && chunksInFile == s.chunkDescsOffset+len(s.chunkDescs)) ||
-			(!s.headChunkPersisted && chunksInFile == s.chunkDescsOffset+len(s.chunkDescs)-1) {
+			((s.headChunkPersisted && chunksInFile == s.chunkDescsOffset+len(s.chunkDescs)) ||
+				(!s.headChunkPersisted && chunksInFile == s.chunkDescsOffset+len(s.chunkDescs)-1)) {
 			// Everything is consistent. We are good.
 			return fp, true
 		}
@@ -475,10 +475,10 @@ func (p *persistence) cleanUpArchiveIndexes(fpToSeries *seriesMap, fpsSeen map[c
 		_, onDisk := fpsSeen[clientmodel.Fingerprint(fp)]
 		if notArchived || !onDisk {
 			if notArchived {
-				glog.Warningf("Archive clean-up: Fingerprint %v is not archived. Purging from archive indexes.", fp)
+				glog.Warningf("Archive clean-up: Fingerprint %v is not archived. Purging from archive indexes.", clientmodel.Fingerprint(fp))
 			}
 			if !onDisk {
-				glog.Warningf("Archive clean-up: Fingerprint %v is not on disk. Purging from archive indexes.", fp)
+				glog.Warningf("Archive clean-up: Fingerprint %v is not on disk. Purging from archive indexes.", clientmodel.Fingerprint(fp))
 			}
 			if err := p.archivedFingerprintToMetrics.Delete(fp); err != nil {
 				return err
