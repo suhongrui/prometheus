@@ -147,7 +147,7 @@ type memorySeries struct {
 	// persisting of a chunk in memory, the offset has to be set).
 	chunkDescsOffset int
 	// The savedFirstTime field is used as a fallback when the
-	// chukDescsOffset is not 0. It can be used to save the firstTime of the
+	// chunkDescsOffset is not 0. It can be used to save the firstTime of the
 	// first chunk before its chunk desc is evicted. In doubt, this field is
 	// just set to the oldest possible timestamp.
 	savedFirstTime clientmodel.Timestamp

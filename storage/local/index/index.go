@@ -18,6 +18,7 @@ package index
 
 import (
 	"flag"
+	"os"
 	"path"
 
 	clientmodel "github.com/prometheus/client_golang/model"
@@ -174,6 +175,12 @@ func NewLabelNameLabelValuesIndex(basePath string) (*LabelNameLabelValuesIndex, 
 	}, nil
 }
 
+// DeleteLabelNameLabelValuesIndex deletes the LevelDB-backed
+// LabelNameLabelValuesIndex. Use only for a not yet opened index.
+func DeleteLabelNameLabelValuesIndex(basePath string) error {
+	return os.RemoveAll(path.Join(basePath, labelNameToLabelValuesDir))
+}
+
 // LabelPairFingerprintsMapping is an in-memory map of label pairs to
 // fingerprints.
 type LabelPairFingerprintsMapping map[metric.LabelPair]codable.FingerprintSet
@@ -240,6 +247,12 @@ func NewLabelPairFingerprintIndex(basePath string) (*LabelPairFingerprintIndex, 
 	return &LabelPairFingerprintIndex{
 		KeyValueStore: labelPairToFingerprintsDB,
 	}, nil
+}
+
+// DeleteLabelPairFingerprintIndex deletes the LevelDB-backed
+// LabelPairFingerprintIndex. Use only for a not yet opened index.
+func DeleteLabelPairFingerprintIndex(basePath string) error {
+	return os.RemoveAll(path.Join(basePath, labelPairToFingerprintsDir))
 }
 
 // FingerprintTimeRangeIndex models a database tracking the time ranges
