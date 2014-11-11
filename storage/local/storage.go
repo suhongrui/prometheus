@@ -478,6 +478,7 @@ func (s *memorySeriesStorage) loop() {
 					// Consume the iterator.
 				}
 			}
+			close(memoryFingerprints)
 		}()
 
 		for {
@@ -501,6 +502,8 @@ func (s *memorySeriesStorage) loop() {
 
 	archivedFingerprints := make(chan clientmodel.Fingerprint)
 	go func() {
+		defer close(archivedFingerprints)
+
 		for {
 			archivedFPs, err := s.persistence.getFingerprintsModifiedBefore(
 				clientmodel.TimestampFromTime(time.Now()).Add(-1 * s.purgeAfter),
@@ -525,13 +528,13 @@ func (s *memorySeriesStorage) loop() {
 			}
 			glog.Infof("Completed maintenance sweep through archived fingerprints in %v.", time.Since(begun))
 		}
-		// TODO: Wait for this goroutine to finish before going on. leveldb access is otherwise a race.
 	}()
 
+loop:
 	for {
 		select {
 		case <-s.loopStopping:
-			return
+			break loop
 		case <-checkpointTicker.C:
 			s.persistence.checkpointSeriesMapAndHeads(s.fpToSeries, s.fpLocker)
 		case <-evictTicker.C:
@@ -543,7 +546,7 @@ func (s *memorySeriesStorage) loop() {
 				select {
 				case <-s.loopStopping:
 					glog.Info("Interrupted evicting chunks.")
-					return
+					break loop
 				default:
 					// Keep going.
 				}
@@ -578,6 +581,11 @@ func (s *memorySeriesStorage) loop() {
 		case fp := <-archivedFingerprints:
 			s.purgeSeries(fp, clientmodel.TimestampFromTime(time.Now()).Add(-1*s.purgeAfter))
 		}
+	}
+	// Wait until both channels are closed.
+	for channelStillOpen := true; channelStillOpen; _, channelStillOpen = <-memoryFingerprints {
+	}
+	for channelStillOpen := true; channelStillOpen; _, channelStillOpen = <-archivedFingerprints {
 	}
 }
 
