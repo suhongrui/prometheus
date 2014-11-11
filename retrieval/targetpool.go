@@ -71,7 +71,6 @@ func (p *TargetPool) Run() {
 			p.addTarget(newTarget)
 		case stopped := <-p.done:
 			p.ReplaceTargets([]Target{})
-			glog.Info("TargetPool exiting...")
 			close(stopped)
 			return
 		}
