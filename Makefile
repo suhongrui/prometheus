@@ -66,7 +66,7 @@ config: dependencies
 	$(MAKE) -C config
 
 dependencies: $(GOCC) $(FULL_GOPATH)
-	$(GOCC) get -d
+	$(GO) get -d
 
 documentation: search_index
 	godoc -http=:6060 -index -index_files='search_index'
