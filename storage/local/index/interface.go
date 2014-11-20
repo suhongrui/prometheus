@@ -21,7 +21,7 @@ import "encoding"
 // UnmarshalBinary methods of the keys and values). For example, if you call the
 // Put method of a KeyValueStore implementation, but the key or the value are
 // modified concurrently while being marshaled into its binary representation,
-// you obviously have a problem. Methods of KeyValueStore only return after
+// you obviously have a problem. Methods of KeyValueStore return only after
 // (un)marshaling is complete.
 type KeyValueStore interface {
 	Put(key, value encoding.BinaryMarshaler) error
@@ -34,25 +34,10 @@ type KeyValueStore interface {
 
 	NewBatch() Batch
 	Commit(b Batch) error
+
+	// ForEach iterates through the complete KeyValueStore and calls the
+	// supplied function for each mapping.
 	ForEach(func(kv KeyValueAccessor) error) error
-
-	Close() error
-}
-
-// Iterator models an iterator over the keys and values in a
-// KeyValueStore. goroutine safety depends on the implementation.
-type Iterator interface {
-	Error() error
-	Valid() bool
-
-	SeekToFirst() bool
-	SeekToLast() bool
-	Seek(encoding.BinaryMarshaler) bool
-
-	Next() bool
-	Previous() bool
-
-	KeyValueAccessor
 
 	Close() error
 }
